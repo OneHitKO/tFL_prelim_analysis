@@ -102,68 +102,33 @@ gc()
 # to do
 # need to troubleshoot why warning stops future_map()
 # map() is fine though
-nbResults = future_map(
-  seq_along(LN_ID),
-  ~ run_numbat(
-    count_mat = splitcounts[[.x]],
-    lambdas_ref = ref_internal,
-    df_allele = alleleCounts[[.x]],
-    genome = "hg38",
-    out_dir = paste0(outdir,LN_ID[[.x]]),
-    t = 1e-06,
-    gamma = 20,
-    min_cells = 30,
-    min_depth = 0,
-    multi_allelic = T,
-    tau = 0.25,
-    ncores = 8,
-    ncores_nni = 8
-  ),
-  .options = furrr_options(
-    seed = T,
-    scheduling = Inf
-  )
-)
-
-rm(nbResults)
+# nbResults = future_map(
+#   seq_along(LN_ID),
+#   ~ run_numbat(
+#     count_mat = splitcounts[[.x]],
+#     lambdas_ref = ref_internal,
+#     df_allele = alleleCounts[[.x]],
+#     genome = "hg38",
+#     out_dir = paste0(outdir,LN_ID[[.x]]),
+#     t = 1e-06,
+#     gamma = 20,
+#     min_cells = 30,
+#     min_depth = 0,
+#     multi_allelic = T,
+#     tau = 0.25,
+#     ncores = 8,
+#     ncores_nni = 8
+#   ),
+#   .options = furrr_options(
+#     seed = T,
+#     scheduling = Inf
+#   )
+# )
+# 
+# rm(nbResults)
 gc()
 
 # ==== BENCHMARK 2 ====
-# ---- get allele counts, was determined in all cells ----
-#wnn = qs::qread("rdata/02_04_integrated.qs", nthreads = 32)
-
-# dir="/scratch/kou/composite/numbat/"
-# files = list.files(paste0(dir,LN_ID), pattern = "tsv.gz$", full.names = T)
-# alleleCounts2 = lapply(files, read_tsv)
-#
-# ## modify cell id to match seurat
-# alleleCounts2 = map2(
-#   LN_ID,
-#   alleleCounts2,
-#   ~ .y %>%
-#     mutate(cell = paste0(.x,"_",cell))
-# )
-
-# # ---- get count matrix ----
-# ## count matrix, split by sample
-# countMat2 = wnn[["RNA"]]@counts
-# 
-# ## split count matrix by sample
-# countMat2 = lapply(1:4, function(x){
-#   mat = countMat2[,grepl(LN_ID[[x]],colnames(countMat2))]
-# 
-#   # round mat to integer, otherwise error later
-#   mat = round(mat)
-#   return(mat)
-# })
-
-# # ---- make patient specific reference matrix ----
-# ## remove bcl2.hi and mitotic bc (likely) tumor cells
-# noBCL2hi = levels(wnn)[!grepl("BCL2.hi|mitotic",levels(wnn))]
-# 
-# ## get counts, subset cells
-# refCounts2 = wnn[["RNA"]]@counts[, Idents(wnn) %in% noBCL2hi]
-# 
 
 ## split ref matrix by sample
 refCounts2 = lapply(seq_along(LN_ID), function(x){
@@ -174,10 +139,9 @@ refCounts2 = lapply(seq_along(LN_ID), function(x){
 ## create anno
 refAnno2 = meta %>%
   filter(cell_id %in% colnames(refCounts)) %>%
-  group_split(Sample, .keep = F) %>%
-  select(cell = cell_id, group = prelim_anno) %>%
+  dplyr::select(cell = cell_id, group = prelim_anno, Sample) %>%
+  group_split(Sample, .keep = F)
   
-
 ## aggregate counts
 ref2 = map2(
   refCounts2,
