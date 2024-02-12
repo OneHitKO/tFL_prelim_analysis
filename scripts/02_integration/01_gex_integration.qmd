@@ -1,0 +1,301 @@
+---
+title: "SCT Integration"
+---
+
+**Libraries**
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(furrr)
+library(shiny)
+library(reticulate)
+library(clustree)
+
+# always set seed!!! need to repeat
+set.seed(105)
+
+plan(
+  list(
+    tweak(multisession, workers = availableCores() %/% 4),
+    sequential
+  )
+)
+
+options(future.globals.maxSize= 4000*1024^2)
+
+# set python
+use_virtualenv("old_scripts/sc_py_env")
+```
+
+**Data Import**
+
+TO DO: remove SCT in previous script!
+
+```{r}
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+sct = qs::qread("rdata/01_04_sctsplit.qs")
+```
+
+### Integration of log normalized RNA
+
+-   Different methods were tested: \[\[TO DO, write description\]\]
+-   No reference was assigned, so all pairwise anchors are found between all samples.
+-   <https://satijalab.org/seurat/articles/seurat5_integration>
+-   <https://satijalab.org/seurat/articles/integration_introduction#introduction-to-scrna-seq-integration>
+
+TO DO: UPDATE previous script to remove SCT.
+SCT will be performed later this script.
+
+```{r}
+# TO DELETE after updating previous script
+# reused after doing sct again 
+DefaultAssay(rna) = "RNA"
+names(rna@reductions)[-11] -> keep
+rna = DietSeurat(rna, assays = "RNA", dimreducs = keep)
+```
+
+```{r}
+#| label: rnaintegration
+
+# CCA
+rna = IntegrateLayers(
+  object = rna, 
+  method = CCAIntegration,
+  orig.reduction = "rnaPCA", 
+  new.reduction = "cca.rnaPCA",
+  verbose = FALSE
+)
+
+# RPCA 
+rna = IntegrateLayers(
+  object = rna, 
+  method = RPCAIntegration,
+  orig.reduction = "rnaPCA", 
+  new.reduction = "rpca.rnaPCA",
+  verbose = FALSE
+)
+
+# harmony
+rna = IntegrateLayers(
+  object = rna, 
+  method = HarmonyIntegration,
+  orig.reduction = "rnaPCA", 
+  new.reduction = "h.rnaPCA",
+  verbose = FALSE
+)
+
+# joint pca
+rna = IntegrateLayers(
+  object = rna, 
+  method = JointPCAIntegration,
+  orig.reduction = "rnaPCA", 
+  new.reduction = "joint.rnaPCA",
+  verbose = FALSE
+)
+```
+
+**Create UMAP embedding for each corrected PCA**
+
+```{r}
+#| label: rnaumaps
+
+# get prefixes for corrected PCAs
+prefix = c("cca","rpca","h","joint")
+
+# umap for each one
+for (i in seq_along(prefix)){
+  rna = RunUMAP(
+    rna, 
+    reduction = paste0(prefix[[i]],".rnaPCA"),
+    dims = 1:30, 
+    reduction.name = paste0(prefix[[i]],".rnaUMAP")
+  )
+}
+
+# plot 
+umaps = names(rna@reductions)[grepl("UMAP",names(rna@reductions))]
+
+# TO DO: troubleshoot
+# get embeddings
+# rnaumaps = map(
+#   umaps,
+#   ~ DimPlot(
+#     rna,
+#     reduction = .x,
+#     pt.size = 0.01,
+#     alpha = 0.5,
+#     combine = F
+#   )
+# )
+# 
+# test = cowplot::plot_grid(plotlist =rnaumaps)
+
+# also do features MS4A1, BCL2
+```
+
+### Integration with SCTransform
+
+TO DO: include notes about sctransform
+
+See this for error on SCT Assay when integrating: <https://github.com/satijalab/seurat/issues/7542#issuecomment-1631534467>
+
+```{r}
+#| label: sctransform
+
+# join layers
+#rna = JoinLayers(rna)
+#test = split(rna, f = rna$orig.ident)
+
+# keep SPLIT layers! 
+# sctransform, default assay set to SCT
+rna = SCTransform(rna, vst.flavor = "v2")
+
+rna = RunPCA(
+  rna, 
+  npcs = 30, 
+  verbose = F,
+  reduction.name = "sctPCA"
+)
+
+# integration: 
+# do I have to join, then split before SCT? that's how i got it to work... 
+# joint
+rna = IntegrateLayers(
+  object = rna,
+  method = JointPCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "joint.sctPCA",
+  verbose = FALSE
+)
+
+# rpca
+rna = IntegrateLayers(
+  object = rna,
+  method = RPCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "rpca.sctPCA",
+  verbose = FALSE
+)
+
+# cca
+rna = IntegrateLayers(
+  object = rna,
+  method = CCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "cca.sctPCA",
+  verbose = FALSE
+)
+
+# harmony
+rna = IntegrateLayers(
+  object = rna,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "h.sctPCA",
+  verbose = FALSE
+)
+```
+
+**Create UMAP Embeddings of integrated SCT data**
+
+```{r}
+# get prefixes for corrected PCAs
+prefix = c("","rpca.","joint.","cca.","cca.","h.")
+
+# umap for each one
+for (i in seq_along(prefix)){
+  rna = RunUMAP(
+    rna, 
+    reduction = paste0(prefix[[i]],"sctPCA"),
+    dims = 1:30, 
+    reduction.name = paste0(prefix[[i]],"sctUMAP")
+  )
+}
+
+qs::qsave(rna, "rdata/02_01_gex.qs", nthreads = 32)
+```
+
+### Plot UMAPs
+
+```{r}
+#| label: plotallembeddings
+
+allumaps = names(rna@reductions)[grepl("UMAP",names(rna@reductions))]
+
+# get embeddings 
+embedall = map(
+  allumaps,
+  ~ Embeddings(rna, .x) %>%
+    as_tibble(rownames = "cell_id") %>%
+    rename(UMAP_1 = 2, UMAP_2 = 3) %>%
+    mutate(umap = .x, sample = rna$orig.ident)
+)
+
+embedall = do.call(rbind, embedall)
+
+# order umap levels
+embedall$umap = factor(
+  embedall$umap,
+  levels = c(
+    "rnaUMAP",
+    "cca.rnaUMAP",
+    "rpca.rnaUMAP",
+    "joint.rnaUMAP",
+    "h.rnaUMAP",
+    "sctUMAP",
+    "cca.sctUMAP",
+    "rpca.sctUMAP",
+    "joint.sctUMAP",
+    "h.sctUMAP"
+  )
+)
+
+# plot
+pl = ggplot(embedall, aes(UMAP_1, UMAP_2))+
+  geom_jitter(aes(color = sample), size = 0.01, alpha = 0.25) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3, panel.grid = element_blank())+
+  facet_wrap(vars(umap), ncol = 5)
+
+ggsave("figures/02/01_allGEXumaps_integration.png",pl,width = 12, height = 8)
+```
+
+**Add Features**
+
+```{r}
+# mandatory to set assay! want to get log norm counts
+DefaultAssay(rna) = "RNA"
+
+genes = c("MS4A1","BCL2","MYC","CD3D","TRAC","CD8A")
+
+expr = FetchData(rna, vars = genes, layer = "data")
+
+embedall = cbind(embedall, expr)
+
+# plot a list
+ft_list = map(
+  genes,
+  ~ ggplot(embedall, aes(UMAP_1, UMAP_2))+
+    geom_jitter(aes(color = .data[[.x]]), size = 0.01, alpha = 0.25) +
+    theme_bw() +
+    theme(aspect.ratio = 3/3, panel.grid = element_blank())+
+    scale_color_viridis_c(option = "plasma", end = 0.85) +
+    facet_wrap(vars(umap), ncol = 5)
+)
+  
+# save everything
+map(
+  seq_along(genes),
+  ~ ggsave(
+    paste0("figures/02/01_allGEXumaps_",genes[[.x]],".png"), 
+    ft_list[[.x]],
+    width = 12, height = 8
+  )
+)
+```

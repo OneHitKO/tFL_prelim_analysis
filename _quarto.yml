@@ -1,0 +1,39 @@
+project:
+  title: "analysis"
+
+author: Kristy Ou
+
+editor: visual
+
+format: 
+  html: 
+    code-fold: true
+    code-line-numbers: false
+    theme: sandstone
+
+execute:
+  echo: true
+  eval: false
+  include: true
+  message: false
+  warning: false
+
+# knitr:
+#   opts_chunk:
+#     comment: "#>"
+#     echo: true
+#     eval: false
+#     include: true
+#     message: false
+#     warning: false
+    
+code-tools: true    
+code-overflow: scroll
+default-image-extension: svg
+fig-cap-location: top
+highlight-style: pygments
+number-sections: false
+toc: true
+toc-location: left
+
+

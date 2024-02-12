@@ -1,0 +1,348 @@
+---
+title: "ATAC QC"
+---
+
+**Packages**
+
+```{r}
+#| label: setup
+library(ArchR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(parallel) # need to set threads > 1
+library(presto)
+library(tidyverse) 
+library(future)
+library(furrr)
+library(ggpubr)
+library(scDblFinder)
+theme_set(theme_bw())
+
+
+set.seed(105)
+addArchRThreads(threads = 32, force = T)
+
+# this step includes ref genome, TxDb object, and blacklist!
+addArchRGenome("hg38")
+
+# future settings
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+))
+```
+
+### ATAC data import
+
+```{r import data, include=T}
+# list of samples
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+
+dir = paste0("~/composite/cellranger/",ln_id,"/outs")
+
+# get vector of frag files
+fragmentFiles = list.files(path=dir, full.names = T, pattern = "fragments.tsv.gz$")
+
+# create arrow files
+ArrowFiles = createArrowFiles(
+  inputFiles = fragmentFiles,
+  sampleNames = ln_id,
+  QCDir = "rdata/archr/QC",
+  excludeChr = c("chrM","chrY"),
+  minTSS = 4,
+  minFrags = 1000,
+  maxFrags = 2e+05,
+  addTileMat = T,
+  TileMatParams = list(binarize = F),
+  addGeneScoreMat = T
+)
+
+# mv archR files, delete in terminal later
+map(
+  ln_id,
+  ~ R.utils::copyFile(
+    srcPathname = paste0(.x,".arrow"),
+    destPathname = paste0("rdata/archr/",.x,".arrow")
+  )
+)
+
+# path to arrow files incase Rstudio didn't save
+ArrowFiles = paste0("rdata/archr/",ln_id,".arrow")
+```
+
+### Doublet score
+
+```{r doublet, include=T}
+# add doublet score, NEED to set threads=1
+doubScores = addDoubletScores(
+    input = ArrowFiles,
+    k = 10,
+    knnMethod = "UMAP",
+    LSIMethod = 1,
+    outDir = "rdata/archr/QC",
+    force = T,
+    threads = 1
+)
+
+## TO DO: display images
+```
+
+### Creating ArchR Project with "unfiltered" cells
+
+However, by default there are a few cutoffs \* TSS enrichment = 4 \* 1000 \< \# unique Frags \< 100,000
+
+```{r create project with all unfiltered cells, include=F, eval=F}
+# create new ArchR project which includes ALL cells
+archR_unflt = ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = "rdata/archr/unflt",
+  copyArrows = F
+)
+
+# save
+archR_unflt = saveArchRProject(
+  ArchRProj = archR_unflt, 
+  outputDirectory = "rdata/archr/unflt", 
+  load = F
+)
+
+archR_unflt = loadArchRProject("rdata/archr/unflt")
+```
+
+### Quality Check
+
+-   Fragment size distribution
+-   TSS enrichment
+
+```{r fragsize, include = T}
+# get df for plotting
+fragSize_df = plotFragmentSizes(
+  ArchRProj = archR_unflt,
+  groupBy = "Sample",
+  returnDF = T
+)
+
+# plot
+as_tibble(fragSize_df) %>%
+  ggplot(.,aes(fragmentSize, fragmentPercent))+
+  geom_line(aes(color = group), linewidth = 0.5)+
+  facet_grid(cols = vars(group))+
+  theme(panel.grid=element_blank(),
+        aspect.ratio = 3/3)+
+  labs(x="Fragment Size", y="Fragments (%)", color = "Sample")
+
+ggsave("figures/01_02_fragsize_unflt.png", height = 2, width = 7)
+```
+
+```{r tss enrich, include = T}
+# get df for plotting
+tssEnrich_df = plotTSSEnrichment(
+  ArchRProj = archR_unflt,
+  groupBy = "Sample",
+  returnDF = T
+)
+
+# plot
+as_tibble(tssEnrich_df) %>%
+  ggplot(.,aes(x = x,y = smoothValue))+
+  geom_line(aes(color = group), linewidth = 0.5)+
+  theme(panel.grid=element_blank(),
+        aspect.ratio = 3/3)+
+  facet_wrap(vars(group),scales = "free_y",nrow=1)+
+  scale_x_continuous(breaks = c(-1500,0,1500))+
+  labs(x="Distance from TSS", y="Normalized Insertion Profile", color = "Sample")
+
+ggsave("figures/01_02_tssEnrich_unflt.png", height = 2.5, width = 7)
+```
+
+```{r uniqueFrag vs TSS enrich,message=F, echo=F}
+meta_all = as_tibble(getCellColData(archR_unflt), rownames = "cell_ID")
+
+meta_all %>%
+  ggplot(., aes(log10(nFrags),TSSEnrichment))+
+  geom_bin2d(bins=100)+
+  scale_fill_viridis_c()+
+  theme(panel.grid=element_blank(),
+        aspect.ratio = 3/3)+
+  facet_wrap(vars(Sample),scales = "free", nrow=1)
+
+ggsave("figures/01_02_unqFrag_vs_TSSenrich_unflt.png", height = 2.5, width = 7)
+```
+
+```{r TSS score, message=F,echo=F}
+ggplot(meta_all, aes(Sample,TSSEnrichment))+
+  geom_violin(aes(fill = Sample))+
+  stat_summary(fun = "median",
+               geom = "crossbar", 
+               width = 0.5,
+               colour = "black")+
+  theme(panel.grid = element_blank(),
+        aspect.ratio=3/3)+
+  labs(y = "TSS Enrichment Score")
+
+ggsave("figures/01_02_vln_TSSenrich_unflt.png", height = 4, width = 4)
+```
+
+```{r nFrag, message=F,echo=F}
+ggplot(meta_all, aes(Sample,log10(nFrags)))+
+  geom_violin(aes(fill = Sample))+
+  stat_summary(fun = "median",
+               geom = "crossbar", 
+               width = 0.5,
+               colour = "black")+
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3)+
+  labs(y = "Log10(Unique Fragments)")
+
+ggsave("figures/01_02_vln_unqFrag_unflt.png", height = 4, width = 4)
+```
+
+### Filtering Doublets
+
+Need to set the filter ratio, which would give the *max* number number of cells to filter out.
+The higher the ratio, the greater the number of removed cells.
+
+Selected different ratios to see how many cells would be eliminated.
+
+```{r flt dblt, include=T}
+fltRatios = seq(1,6, by=0.5)
+
+# get list of proj w/ different filter ratios
+flt_proj = map(
+  fltRatios, 
+  ~ filterDoublets(archR_unflt, filterRatio = .x)
+)
+```
+
+Plot number of cells that are removed w/ each filter ratio.
+
+```{r plot dblt removal, include=T}
+# set names
+names(flt_proj) = paste0("filterRatio_", fltRatios)
+
+# plot number of cells
+dblt = map(
+  seq_along(flt_proj),
+  ~ getCellColData(flt_proj[[.x]]) %>%
+    as_tibble(.) %>%
+    count(Sample) %>%
+    mutate(ratio = fltRatios[[.x]])
+)
+
+dblt = do.call(rbind,dblt)
+
+ggplot(dblt, aes(ratio,n)) + 
+  geom_line(aes(color = Sample), size = 1) + 
+  theme(aspect.ratio = 3/4) +
+  facet_wrap(vars(Sample), scales = "free", ncol = 5) + 
+  labs(x = "ArchR Doublet Filter Ratio", y = "# Cells After\nDoublet Removal")
+
+ggsave("figures/01_02_dbltRatio_nCellsLeft.png", height = 3, width = 7)
+```
+
+In the end, used ratio = 1.5, but can readjust after annotation if signatures seems like there are doublets
+
+```{r save flt dataset, include=F}
+archR_flt = saveArchRProject(
+  ArchRProj = flt_proj$filterRatio_2, 
+  outputDirectory = "rdata/archr/flt", 
+  load = T
+)
+
+archR_flt = loadArchRProject("rdata/archr/flt")
+```
+
+### Find doublets with AMULET
+
+Performs better than ArchR when two similar cells (homotypic) are doublets.
+Use UNFILTERED ArchR project to compare
+
+```{r amulet, include=T}
+# get fragments, returns GRanges w/ cell_id in mcol 
+frags_unflt = getFragmentsFromProject(archR_unflt)
+
+# chrM, chrX, and chrY should be removed
+frags_unflt = lapply(
+  frags_unflt, 
+  dropSeqlevels, 
+  value = c("chrX","chrY","chrM"), 
+  pruning.mode = "coarse"
+)
+
+# change mcol to "name"
+frags_unflt = lapply(frags_unflt, function(gr){
+  names(mcols(gr)) = "name"
+  return(gr)
+})
+
+# run amulet 
+amulet_res = future_map(
+  frags_unflt, 
+  ~ amulet(.x)
+)
+
+# return cell_ids that are multiplets (q.value < 0.05)
+toDISCARD = lapply(amulet_res, function(x){
+  dontkeep = rownames(x)[which(x$q.value < 0.05)]
+  return(dontkeep)
+})
+
+# can delete later
+saveRDS(toDISCARD, "rdata/01_02_toDISCARD.rds")
+```
+
+Compare which cells were captured by ArchR simulation based doublet removal and
+
+```{r comparison, include=T}
+# cells before filtering
+cells_unflt = rownames(getCellColData(archR_unflt))
+
+# cells passed filtered by ArchR
+cells_ArchR_flt = rownames(getCellColData(archR_flt))
+
+# cells that were called multiplets by ArchR
+mlt_ArchR = setdiff(cells_unflt,cells_ArchR_flt)
+
+# cells called multiplets by AMULET
+mlt_AMULET = unlist(toDISCARD)
+
+# get cells called by both
+mlt_both = intersect(mlt_ArchR,mlt_AMULET)
+
+# create tibble for plotting summary
+plot_mlt = tibble(
+  cell_ids = cells_unflt,
+  is.multiplet = case_when(
+    cells_unflt %in% setdiff(mlt_ArchR,mlt_both) ~ "ArchR Only",
+    cells_unflt %in% setdiff(mlt_AMULET,mlt_both) ~ "AMULET Only",
+    cells_unflt %in% mlt_both ~ "Both"
+    )
+  ) %>%
+  dplyr::mutate(
+    is.multiplet = replace_na(is.multiplet,"Neither (Singlets)"),
+    LN_ID = gsub("#.*","",cells_unflt)
+  ) %>% 
+  group_by(LN_ID,is.multiplet) %>%
+  summarize(nCells = n())
+
+ggplot(plot_mlt, aes(LN_ID,nCells)) +
+  geom_col(aes(fill = is.multiplet)) +
+  theme(aspect.ratio = 4/4,
+        panel.grid = element_blank()) +
+  labs(x=NULL)
+
+ggsave("figures/01_02_atacMultiplets_summary.png",width = 5,height = 3)
+```
+
+### Filter additional cells from ArchR_flt project
+
+```{r update archR flt, include=T}
+archR_flt2 = archR_flt[!(archR_flt$cellNames %in% mlt_AMULET),]
+
+# overwrite 
+archR_flt = saveArchRProject(
+  ArchRProj = archR_flt2, 
+  outputDirectory = "rdata/archr/flt", 
+  dropCells = T,
+  load = F
+)
+```

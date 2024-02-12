@@ -1,0 +1,257 @@
+---
+title: "Convert ArchR to Signac"
+---
+
+**Libraries**
+
+```{r}
+library(ArchRtoSignac)
+library(ArchR)
+library(Signac)
+library(Seurat)
+library(stringr)
+library(EnsDb.Hsapiens.v86)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(furrr)
+
+set.seed(105)
+addArchRThreads(threads = 32, force = T)
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+## Converting ArchR to Signac Chromatin Assay
+
+Note: some "items" can be calculated within Signac, such as Tn5 insertion bias matrix.
+Can always add additional matrices calculated in ArchR.
+
+**Load**
+
+```{r}
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+dir = paste0("rdata/archr/",ln_id)
+
+archR_all = lapply(dir,loadArchRProject)
+```
+
+**Path to fragment files**
+
+```{r}
+# list of samples
+dir = paste0("~/composite/cellranger/",ln_id,"/outs/")
+
+# get vector of frag files
+fragmentFiles = list.files(path=dir, full.names = T, pattern = "fragments.tsv.gz$")
+```
+
+**Counts of binned genome**
+
+Need to use Tile Matrix that has NOT binarized.
+Had to repeat ATAC seq processing to generate new arrow Files and ArchR project with non-binarized matrix.
+Note on ranges: <https://github.com/GreenleafLab/ArchR/issues/330>
+
+```{r}
+# get list of SE containing tile matrix
+# TO DO: rename columns here to shorten code! 
+SE_nonBin = lapply(archR_all, getMatrixFromProject, useMatrix = "TileMatrix")
+
+counts_nonBin = lapply(SE_nonBin, assay)
+names(counts_nonBin) = ln_id
+
+# rename colnames so matches original fragment file (ie: only cell barcode, no "LNXXXX#" prefix)
+counts_nonBin = lapply(counts_nonBin, function(x){
+  colnames(x) = gsub("LN.*#","",colnames(x)) 
+  return(x)
+  }
+)
+```
+
+**Get ranges associated with binned genome**
+
+```{r}
+# get ranges, convert to GRanges
+rangesOfCounts = lapply(SE_nonBin, rowData)
+
+# create function to make granges
+convert2GR = function(rowDataDF){
+  
+  # end is binsize - 1 (ie: 500 - 1)
+  rowDataDF$end = rowDataDF$start + 499 
+  rowDataGR = makeGRangesFromDataFrame(rowDataDF)
+  return(rowDataGR)
+}
+
+# convert ranges
+rangesOfCounts = lapply(rangesOfCounts,convert2GR)
+
+# since using TileMatrix to create chromatinAssay, the binned genome is the same for all samples
+# check w/ lapply(rangesOfCounts,length)
+rangesBinned = rangesOfCounts[[1]]
+```
+
+**Get Annotation**
+
+```{r}
+# "UCSC" is the default style to change to but can be changed with argument seqStyle
+# confirmed that this is the correct annotation style for signac based on signac vignette
+# used wrapper function from ArchRtoSignac
+hg38_anno = getAnnotation(
+  reference = EnsDb.Hsapiens.v86, # do gencode?
+  refversion = "hg38", 
+  seqStyle = "UCSC"
+)
+```
+
+### Create `Chromatin Assay`
+
+-   Notes on structure: <https://stuartlab.org/signac/articles/data_structures.html>
+-   Remove features not in at least 1% of cells
+
+```{r}
+chrAssays = map(
+  seq_along(counts_nonBin), 
+  ~ CreateChromatinAssay(
+    counts = counts_nonBin[[.x]],
+    fragments = fragmentFiles[[.x]],
+    min.cells = round(ncol(counts_nonBin[[.x]])*0.01),
+    ranges = rangesBinned,
+    genome = "hg38",
+    annotation = hg38_anno,
+    validate.fragments = T
+  )
+)
+
+names(chrAssays) = ln_id
+```
+
+### Convert to Seurat Object for integration
+
+Create `Seurat Object` for integration in next step.
+Note: Had to convert now to rename cells (did not work for `Chromatin Assay` object at the time of processing).
+
+```{r}
+# first get metadata to add to seurat object
+metadata_list = lapply(archR_all, function(x) x@cellColData)
+
+# rename rows to match names of cells in chrAssay
+metadata_list = lapply(metadata_list, function(x){
+  newNames = gsub("LN.*#","",rownames(x))
+  rownames(x) = newNames
+  return(as.data.frame(x))
+})
+
+# confirm cells are in same order as in chrAssay
+lapply(seq_along(metadata_list), function(x){
+  isSameOrder = rownames(metadata_list[[x]]) == Cells(chrAssays[[x]])
+  all(isSameOrder)
+})
+
+# create Seurat objects
+atacSeurat = map2(
+  chrAssays, 
+  metadata_list, 
+  ~ CreateSeuratObject(
+    counts = .x,
+    meta.data = .y,
+    assay = "ATAC",
+    project = "tFL"
+  )
+)
+
+# add prefix to cells
+atacSeurat = map2(atacSeurat,ln_id, ~ RenameCells(.x, add.cell.id = .y))
+```
+
+### Add Embeddings from ArchR Projects
+
+-   UMAP from lsi4
+-   Iterative LSI4
+
+```{r}
+# get umap embedding
+umapEmbed = lapply(archR_all, getEmbedding, embedding = "lsi4.atacUMAP")
+
+# rename colnames and rownames
+umapEmbed = lapply(umapEmbed, function(x){
+  colnames(x) = c("atacUMAP_1","atacUMAP_2")
+  rownames(x) = gsub("#","_",rownames(x))
+  return(as.matrix(x))
+})
+
+# get LSI embedding
+lsi4Dim = lapply(archR_all, getReducedDims, reducedDims = "LSI_4")
+
+# rename rownames
+lsi4Dim = lapply(lsi4Dim, function(x){
+  rownames(x) = gsub("#","_",rownames(x))
+  return(as.matrix(x))
+})
+
+# add embeddings to seurat object
+atacSeurat = lapply(seq_along(atacSeurat), function(x){
+  
+  # add umap generated on individual samples
+  atacSeurat[[x]][["atacUMAP"]] = CreateDimReducObject(
+    embeddings = umapEmbed[[x]], 
+    key = "atacUMAP_", 
+    assay = "ATAC"
+  )
+  
+  # add lsi4
+  atacSeurat[[x]][["iterLSI_4"]] = CreateDimReducObject(
+    embeddings = lsi4Dim[[x]],
+    key = "atacIterLSI4_", 
+    assay = "ATAC"
+  )
+  
+  return(atacSeurat[[x]])
+})
+```
+
+### Add Gene Score Activity Matrix
+
+```{r}
+# get imputed gene score to add to chromatin assay
+geneScoreMat = lapply(archR_all, getMatrixFromProject, useMatrix = "GeneScoreMatrix", verbose=F)
+geneNames = geneScoreMat[[1]]@elementMetadata$name
+
+# get impute weights
+imputeWeights = lapply(archR_all, getImputeWeights)
+
+# get matrix w impute scores
+# need to use se object in geneScoreMat to get gene names (rows)
+# next time: future_map2
+imputedMat = map2(
+  geneScoreMat,
+  imputeWeights, 
+  ~ imputeMatrix(assay(.x),.y)
+)
+names(imputedMat) = ln_id
+
+# rename rows
+imputedMat = lapply(imputedMat, function(x){
+  rownames(x) = geneNames
+  colnames(x) = gsub("#","_",colnames(x)) 
+  
+  # round
+  x = round(x, digits = 3)
+  
+  # convert to matrix
+  x = as.matrix(x)
+  return(x)
+})
+
+# add imputed gene score activity as an assay for access later
+## cols = cells, rows = features
+atacSeurat = lapply(seq_along(atacSeurat), function(x){
+  atacSeurat[[x]][["GeneScoreImputed"]] = CreateAssayObject(
+    data = imputedMat[[x]]
+  )
+  return(atacSeurat[[x]])
+})
+```
+
+**Save**
+
+```{r}
+qs::qsave(atacSeurat,"rdata/02_01_atac_seurat.qs",nthreads = 32)
+```

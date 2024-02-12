@@ -1,0 +1,577 @@
+---
+title: "QC of Visium"
+author: "Kristy Ou"
+---
+
+```{r}
+#| label: setup
+
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(reticulate)
+
+theme_set(theme_bw())
+
+set.seed(105)
+
+use_virtualenv("~/composite/analysis/old_scripts/sc_py_env")
+```
+
+## Overview
+
+### 10X Visium
+
+-   For 6.5 x 6.5 mm2 capture areas, there are approx. 5000 barcoded spots
+-   17,943 genes are targeted in V1 chemistry probe panel; most genes covered by 1 probe set
+
+### Sample Description
+
+```{r}
+#| label: sample_desc
+
+## TO DO: INSERT TABLE
+```
+
+### Seurat import
+
+```{r}
+#| label: import
+
+# get dir
+path = "/g/saka/Kristy/projects/composite/spaceranger"
+dirs = list.files(
+  path = path, 
+  pattern = "^outs$", 
+  include.dirs = T, 
+  recursive = T, 
+  full.names = T
+)
+
+# get name of samples
+names = list.files(
+  path=path,
+  include.dirs=T,
+  recursive = F,
+  full.names=F
+)
+
+# import spatial data
+spatial = map(
+  seq_along(dirs),
+  ~ Load10X_Spatial(
+    data.dir = dirs[[.x]],
+    assay = "Visium",
+    filename = "filtered_feature_bc_matrix.h5",
+    slice = names[[.x]]
+  )
+)
+
+names(spatial) = names
+```
+
+**QC**
+
+```{r}
+#| label: num_spatial_barcodes
+#| fig-cap: "spots per sample"
+
+overview = tibble(
+  punch_id = names(spatial),
+  ln_id = gsub("_.*","",names(spatial)),
+  n_barcodes = sapply(spatial, ncol, simplify = T)
+)
+
+ggplot(overview, aes(n_barcodes,fct_rev(punch_id)))+
+  geom_col(aes(fill = ln_id)) +
+  theme(axis.text = element_text(size = 18),
+        axis.title = element_text(size = 20),
+        panel.grid = element_blank()) +
+  labs(
+    y = "Region of Interest", 
+    x = "Number of Recovered Spatial Barcodes (Spots)"
+  ) 
+
+ggsave("figures/01/06_spotcovpersample.png",height = 5, width = 3.5)
+```
+
+```{r}
+#| label: features_per_spot
+
+# get metadata
+meta_list = map(
+  seq_along(spatial), 
+  ~ spatial[[.x]]@meta.data %>%
+    as_tibble(rownames = "Spatial_Barcode") %>%
+    mutate(Sample = names(spatial)[[.x]], 
+           LN_ID = gsub("_.*","", names(spatial)[[.x]])) 
+)
+
+meta_master = do.call(rbind, meta_list)
+```
+
+### Filtering
+
+**Remove Sections from list**
+
+-   Removed LN0025_1DA209_R1, LN0027_1VL5B2_R1, LN00438_MAAFHY1_R1, LN00438_MAAFHY1_R2, LN00438_MAAFHYB_R2
+
+```{r}
+# samples had too little spots, detachment, or low UMI count/spot
+discard = c(
+  "LN0025_1DA209_R1",
+  "LN0027_1VL5B2_R1",
+  "LN0438_MAAFHY1_R1",
+  "LN0438_MAAFHY1_R2",
+  "LN0438_MAAFHYB_R2"
+)
+
+spatial = spatial[!(names(spatial) %in% discard)]
+```
+
+**Filter Spots**
+
+```{r}
+spatial = map(
+  spatial, 
+  ~ subset(
+    .x, 
+    subset = nCount_Visium >= 500 & nFeature_Visium >= 200
+  )
+)
+```
+
+**Add sample name to meta data**
+
+```{r}
+spatial= lapply(seq_along(spatial), function(x){
+  fullname = names(spatial)[[x]]
+  
+  # add to metadata
+  spatial[[x]]$full_name = fullname
+  spatial[[x]]$ln_id = gsub("_.*","",fullname)
+  spatial[[x]]$ffpeROI = gsub("LN[0-9]{4}_","",fullname)
+  
+  # prefix
+  pre = gsub("LN[0-9]{4}_","",fullname)
+  
+  # append to spot id
+  spatial[[x]] = RenameCells(spatial[[x]], add.cell.id = pre)
+  
+  return(spatial[[x]])
+})
+```
+
+### Normalization
+
+-   Perform SCT normalization, control for variance
+-   To do: log normalize? how does it work without knowing \# nuclei / spot
+
+```{r}
+# merge but keep layers
+merged = merge(spatial[[1]], spatial[-1])
+
+# sctransform
+merged = SCTransform(merged, assay = "Visium", verbose = FALSE)
+
+# dim reduction
+merged = RunPCA(
+  merged, 
+  npcs = 30, 
+  verbose = F,
+  reduction.name = "sctPCA"
+)
+```
+
+### TO MOVE to new script: Sample Integration
+
+-   test integrating ALL samples together
+-   test all integration methods
+
+```{r}
+# integration: 
+
+# joint
+merged = IntegrateLayers(
+  object = merged,
+  method = JointPCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "joint.sctPCA",
+  verbose = FALSE
+)
+
+# rpca
+merged = IntegrateLayers(
+  object = merged,
+  method = RPCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "rpca.sctPCA",
+  verbose = FALSE
+)
+
+# cca
+merged = IntegrateLayers(
+  object = merged,
+  method = CCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "cca.sctPCA",
+  verbose = FALSE
+)
+
+# harmony
+merged = IntegrateLayers(
+  object = merged,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "h.sctPCA",
+  verbose = FALSE
+)
+```
+
+**UMAP Embeddings**
+
+```{r}
+# get prefixes for corrected PCAs
+prefix = c("","rpca.","joint.","cca.","cca.","h.")
+
+# umap for each one
+for (i in seq_along(prefix)){
+  merged = RunUMAP(
+    merged, 
+    reduction = paste0(prefix[[i]],"sctPCA"),
+    dims = 1:30, 
+    reduction.name = paste0(prefix[[i]],"sctUMAP")
+  )
+}
+
+```
+
+### Plot UMAPs
+
+```{r}
+# get umap names
+allumaps = names(merged@reductions)[grepl("UMAP",names(merged@reductions))]
+
+# get embeddings 
+embedall = map(
+  allumaps,
+  ~ Embeddings(merged, .x) %>%
+    as_tibble(.,rownames = "spot_id") %>%
+    dplyr::rename(., UMAP_1 = 2, UMAP_2 = 3) %>%
+    mutate(umap = .x, ln_id = merged$ln_id, ffpeROI = merged$ffpeROI)
+)
+
+embedall = do.call(rbind, embedall)
+
+# order umap levels
+embedall$umap = factor(
+  embedall$umap,
+  levels = c(
+    "sctUMAP",
+    "cca.sctUMAP",
+    "rpca.sctUMAP",
+    "joint.sctUMAP",
+    "h.sctUMAP"
+  )
+)
+
+# plot
+pl = ggplot(embedall, aes(UMAP_1, UMAP_2))+
+  geom_jitter(aes(color = ln_id), size = 0.01, alpha = 0.25) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3, panel.grid = element_blank())+
+  facet_grid(cols = vars(umap), rows = vars(ln_id))
+
+ggsave("figures/01/06_allVisiumUMAPs_integration.png",pl,width = 12, height = 8)
+```
+
+**Remove Embeddings**
+
+```{r}
+merged = DietSeurat(
+  merged,
+  layers = NULL,
+  assays = NULL,
+  dimreducs = c("sctPCA","h.sctPCA","h.sctUMAP"),
+)
+
+qs::qsave(merged, "rdata/01_06_merged_visium.qs", nthreads = 32)
+```
+
+### Focus on LN0438
+
+-   redid dim reduction and clustering
+
+**Subset**
+
+```{r}
+ln0438 = merged[,merged$ln_id == "LN0438"]
+keepimages = c(
+  "LN0438_MAAFHY1_R3",
+  "LN0438_MAAFHY3_R1",
+  "LN0438_MAAFHY3_R2",
+  "LN0438_MAAFHYB_R1"
+)
+
+ln0438@images = ln0438@images[keepimages]
+
+DefaultAssay(ln0438) = "Visium"
+
+# remove sct
+ln0438 = DietSeurat(
+  ln0438,
+  layers = NULL,
+  assays = "Visium",
+  dimreducs = NULL
+)
+```
+
+**Redo PCA, h.PCA, UMAP**
+
+```{r, include=F}
+# PCA
+# sctransform
+ln0438 = SCTransform(ln0438, assay = "Visium", verbose = FALSE)
+
+# dim reduction
+ln0438 = RunPCA(
+  ln0438, 
+  npcs = 30, 
+  verbose = F,
+  reduction.name = "sctPCA"
+)
+
+# harmony
+ln0438 = IntegrateLayers(
+  object = ln0438,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "h.sctPCA",
+  verbose = FALSE
+)
+
+# rpca
+ln0438 = IntegrateLayers(
+  object = ln0438,
+  method = RPCAIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "sctPCA", 
+  new.reduction = "rpca.sctPCA",
+  verbose = FALSE
+)
+
+# umap w harmony
+ln0438 = RunUMAP(
+  ln0438, 
+  reduction = "h.sctPCA",
+  dims = 1:30, 
+  reduction.name = "h.sctUMAP"
+)
+
+# umap w rpca
+ln0438 = RunUMAP(
+  ln0438, 
+  reduction = "rpca.sctPCA",
+  dims = 1:30, 
+  reduction.name = "rpca.sctUMAP"
+)
+
+# plot
+p1 = DimPlot(
+  ln0438, 
+  pt.size = 0.01,
+  reduction = "rpca.sctUMAP", 
+  group.by = "ffpeROI",
+  shuffle = T) +
+  theme(aspect.ratio = 3/3)
+
+p2 = DimPlot(
+  ln0438, 
+  pt.size = 0.01,
+  reduction = "h.sctUMAP", 
+  group.by = "ffpeROI",
+  shuffle = T
+) +
+  theme(aspect.ratio = 3/3)
+
+p1+p2
+```
+
+#### Clustering with harmony integrated data
+
+```{r}
+# neighbors
+ln0438 = FindNeighbors(
+  ln0438, 
+  reduction = "h.sctPCA", 
+  dims = 1:30
+)
+
+# clusters
+ln0438 = FindClusters(
+  ln0438, 
+  resolution = c(0.5),
+  algorithm = 4
+)
+```
+
+#### Visualize clusters, use res 0.5
+
+**UMAP**
+
+```{r}
+# get embeddings
+# Idents(ln0438) = "h.sctPCA_snn_res.0.5"
+# ln0438$seurat_clusters = Idents(ln0438)
+
+# embed = Embeddings(ln0438, reduction = "h.sctUMAP")
+# embed = cbind(embed, ln0438@meta.data)
+# 
+# ggplot(embed, aes(hsctUMAP_1, hsctUMAP_2))+
+#   geom_jitter(aes(color = seurat_clusters), size = 0.01)+
+#   theme_bw()+
+#   theme(aspect.ratio=3/3,
+#         panel.grid = element_blank()) + 
+#   scale_color_manual(values = hcl.colors(14, palette = "Spectral"))
+
+# by ffpeROI
+umapffproi = DimPlot(ln0438, label = F, repel = T,group.by = "ffpeROI") +
+  theme(aspect.ratio = 3/3,
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  scale_color_manual(values = rev(hcl.colors(5, palette = "Tropic")[c(1,2,4,5)]))
+
+ggsave("figures/01/06_ln0438_ROI_h.sctUMAP.png",umapffproi, width=5,height = 5)
+
+
+# relevel clusters, assign color 
+left = c(
+  "13"="clust_1",
+  "8"="clust_2",
+  "1"="clust_3",
+  "10"="clust_4",
+  "6"="clust_5",
+  "11"="clust_6"
+)
+leftpal = hcl.colors(n=6,"Sunset",rev=F)
+
+right = c(
+  "4"="clust_7",
+  "9"="clust_8",
+  "3"="clust_9",
+  "7"="clust_10",
+  "2"="clust_11",
+  "12"="clust_12",
+  "5"="clust_13"
+)
+rightpal = hcl.colors(n=8,"Emrld",rev = T)[2:8]
+
+levels(ln0438) = c(names(left),names(right))
+ln0438 = RenameIdents(ln0438, c(left,right))
+
+ln0438umap = DimPlot(ln0438, label = F, repel = T) +
+  theme(aspect.ratio = 3/3,
+        axis.ticks = element_blank(),
+        axis.text = element_blank()) + 
+  scale_color_manual(values = c(leftpal,rightpal),
+                     labels = c(left,right))
+
+ggsave("figures/01/06_ln0438_h.sctUMAP.png",ln0438umap, width=5,height = 5)
+
+ln0438umap
+```
+
+**Spatial Plots**
+
+```{r}
+sppl = lapply(names(ln0438@images), function(x){
+  SpatialDimPlot(
+    ln0438,
+    images = x,
+    label = F
+  )+
+   scale_fill_manual(values = c(leftpal,rightpal),
+                     labels = c(left,right),
+                     drop = F)
+})
+
+cowplot::plot_grid(plotlist = sppl)
+```
+
+#### Markers?
+
+```{r}
+DefaultAssay(ln0438) = "SCT"
+
+# rename umi assay to avoid error
+for (i in seq_along(ln0438@assays$SCT@SCTModel.list)){
+  slot(object = ln0438@assays$SCT@SCTModel.list[[i]], name="umi.assay") = "Visium"
+}
+
+# check
+SCTResults(object=ln0438, slot="umi.assay")
+
+# prep and find markers
+ln0438 = PrepSCTFindMarkers(ln0438, assay = "SCT")
+
+# find all markers
+allmark = FindAllMarkers(
+  ln0438,
+  logfc.threshold = 0.6,
+  only.pos = T,
+  min.pct = 0.5,
+  max.cells.per.ident = 800
+)
+```
+
+**Plot top TLS markers**
+
+```{r}
+# read tls csv
+tls = read_csv("other/IOC_tls.csv", skip=1)
+tls = tls %>%
+  filter(Ctrl_TLS_NSCLC_DEG.1 == TRUE)
+
+# take note of GoI
+tlsyellow = c("FDCSP","CXCL13","CXCR5","LINC00926","CCL19","TNFRSF13C","CCR7","FBN1")
+
+# subset marker list
+tls_de = allmark %>%
+  filter(gene %in% tls$gene_symbol)
+
+yellow_de = allmark %>%
+  filter(gene %in% tlsyellow)
+
+SpatialFeaturePlot(ln0438, features = c("FBN1"))
+```
+
+```{r}
+yellowFtPlts = map(
+  tlsyellow[tlsyellow %in% yellow_de$gene],
+  ~ FeaturePlot(ln0438, features = .x, max.cutoff = "q99", pt.size = 0.1)+
+    theme(aspect.ratio = 3/3,
+          axis.text = element_blank(),
+          axis.ticks = element_blank()) +
+    labs(x = NULL, y=NULL) +
+    scale_color_viridis_c(option = "magma", end = 0.85)
+)
+
+p1 = cowplot::plot_grid(plotlist = yellowFtPlts, align = "hv", ncol = 3)
+
+ggsave("other/tlsyellow_featureumap.png",p1, height = 4.5, width = 8)
+```
+
+## References
+
+-   <https://satijalab.org/seurat/articles/spatial_vignette.html>
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

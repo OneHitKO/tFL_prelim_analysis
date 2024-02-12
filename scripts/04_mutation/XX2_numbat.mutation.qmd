@@ -1,0 +1,599 @@
+---
+title: "Numbat haplotype-aware CNV analysis at single cell resolution"
+---
+
+**Packages**
+
+```{r}
+#| label: setup
+library(Seurat)
+library(Signac)
+library(tidyverse, quietly = T)
+library(shiny)
+library(numbat)
+library(furrr)
+library(future.apply)
+
+source("_theme.R")
+
+# always set seed!!!
+set.seed(105)
+
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+))
+```
+
+**Data import**
+
+```{r}
+#| label: data
+LN_ID = c("LN0025","LN0177","LN0193","LN0438")
+wnn = qs::qread("rdata/02.04_wnn.qs")
+meta = wnn@meta.data
+
+# embeddings for plotting
+embeds = cbind(
+  Embeddings(wnn,"atacUMAP"),
+  Embeddings(wnn,"sctUMAP"),
+  Embeddings(wnn,"wnnUMAP")
+)
+
+# save together? qsavem?
+```
+
+## Running Numbat
+
+### Notes on preparing data
+
+-   Counted alleles and phased SNPs in bam files using `scripts/03_prelim.annotation/XX_prepare.numbat.sh`
+-   After SNP phasing, prepared the following input for `run_numbat()`:
+    1.  output of allele counts
+    2.  count matrix (gene x cell)
+    3.  reference expression matrix
+
+### Important parameters
+
+-   Other notes for `run_numbat()` , see "Run Parameters": <https://kharchenkolab.github.io/numbat/articles/numbat.html>
+-   Lower `t` (transition property) is better for resolving additional subclonal events
+-   Lower `max_cost` generates more clones. Default: `ncol(count_mat) * tau`
+-   Default `tau` = 0.3, set lower to find more clones
+-   See `scripts/03_prelim.annotation/XX1_run.numbat.slurmR`
+
+### Benchmark 1
+
+-   Allele / Count input: all cells (except singleton, mitotic), separated by patient
+-   Expression reference: all cells minus singleton, mitotic, BCL2.hi B cells; collective
+-   `t` transition probabiltiy: 1e-6
+-   `tau` = 0.25
+
+```{r}
+#| label: benchmark1_code
+
+# define cells to keep ----
+keep = Cells(wnn)[!(Idents(wnn) %in% c("singleton","mitotic"))]
+
+# get allele counts, was determined in all cells ----
+dir="/scratch/kou/composite/numbat/"
+files = list.files(paste0(dir,LN_ID), pattern = "tsv.gz$", full.names = T)
+alleleCounts = lapply(files, read_tsv)
+
+## modify cell id to match seurat, filter for "keep" cells
+alleleCounts = map2(
+  LN_ID,
+  alleleCounts, 
+  ~ .y %>%
+    mutate(cell = paste0(.x,"_",cell)) %>%
+    filter(cell %in% keep)
+)
+
+# get count matrix ----
+## count matrix, split by sample
+countMat = wnn[["RNA"]]@counts
+
+## remove mitotic and singletons
+countMat = countMat[,colnames(countMat) %in% keep]
+
+## split count matrix by sample
+countMat = lapply(1:4, function(x){
+  mat = countMat[,grepl(LN_ID[[x]],colnames(countMat))]
+  
+  # round mat to integer, otherwise error later
+  mat = round(mat)
+  
+  return(mat)
+})
+
+# make collective reference matrix ----
+## remove bcl2.hi (likely) tumor cells
+noBCL2hi = levels(wnn)[!grepl("BCL2.hi|singleton|mitotic",levels(wnn))]
+
+## get counts, subset cells 
+refCounts = wnn[["RNA"]]@counts[, Idents(wnn) %in% noBCL2hi]
+
+## create anno
+refAnno = meta %>% 
+  mutate(cell = paste0(orig.ident,"_",cell_ids)) %>%
+  filter(cell %in% colnames(refCounts)) %>%
+  select(cell, group = prelim_anno)
+
+## aggregate counts
+ref_internal = aggregate_counts(
+  count_mat = refCounts, 
+  annot = refAnno, 
+  normalized = T, 
+  verbose = F
+)
+
+# run numbat ----
+## should run on slurm next time
+outdir="rdata/numbat/benchmark1/"
+nbResults = map(
+  seq_along(countMat),
+  ~ run_numbat(
+    count_mat = countMat[[.x]],
+    lambdas_ref = ref_internal,
+    df_allele = alleleCounts[[.x]],
+    genome = "hg38",
+    out_dir = paste0(outdir,LN_ID[[.x]]),
+    t = 1e-06, 
+    gamma = 20,
+    min_cells = 30, 
+    min_depth = 0,
+    multi_allelic = T,
+    tau = 0.25,
+    ncores = 1,
+    ncores_nni = 1
+  )
+)
+```
+
+### Benchmark 2
+
+-   Allele / Count input: all cells (including singleton and mitotic!), separated by patient
+-   Expression reference: all cells minus singleton, mitotic, BCL2.hi B cells; used patient specific reference
+-   `t` transition probabiltiy: 1e-6
+-   `tau` = 0.25
+
+```{r}
+#| label: benchmark2_code
+
+# ---- get allele counts, was determined in all cells ----
+dir="/scratch/kou/composite/numbat/"
+files = list.files(paste0(dir,LN_ID), pattern = "tsv.gz$", full.names = T)
+alleleCounts2 = lapply(files, read_tsv)
+
+## modify cell id to match seurat
+alleleCounts2 = map2(
+  LN_ID,
+  alleleCounts2, 
+  ~ .y %>%
+    mutate(cell = paste0(.x,"_",cell))
+)
+
+# ---- get count matrix ----
+## count matrix, split by sample
+countMat2 = wnn[["RNA"]]@counts
+
+## split count matrix by sample
+countMat2 = future_lapply(1:4, function(x){
+  mat = countMat2[,grepl(LN_ID[[x]],colnames(countMat2))]
+  
+  # round mat to integer, otherwise error later
+  mat = round(mat)
+  return(mat)
+})
+
+# ---- make patient specific reference matrix ----
+## remove bcl2.hi and mitotic bc (likely) tumor cells
+noBCL2hi = levels(wnn)[!grepl("BCL2.hi|mitotic",levels(wnn))]
+
+## get counts, subset cells 
+refCounts2 = wnn[["RNA"]]@counts[, Idents(wnn) %in% noBCL2hi]
+
+## split ref matrix by sample
+refCounts2 = future_lapply(1:4, function(x){
+  mat = refCounts2[,grepl(LN_ID[[x]],colnames(refCounts2))]
+  return(mat)
+})
+
+## create anno 
+refAnno2 = meta %>%
+  filter(prelim_anno %in% noBCL2hi) %>%
+  rownames_to_column(var = "cell") %>%
+  group_by(orig.ident) %>%
+  select(orig.ident, cell, group = prelim_anno) %>%
+  group_split(.keep = F)
+
+## aggregate counts
+ref2 = future_map2(
+  refCounts2, 
+  refAnno2,
+  ~ aggregate_counts(
+    count_mat = .x,
+    annot = .y, 
+    normalized = T, 
+    verbose = F
+  )
+)
+
+# ---- run numbat ----
+outdir="rdata/numbat/benchmark2/"
+
+nbResults2 = future_map(
+  seq_along(countMat2),
+  ~ run_numbat(
+    count_mat = countMat2[[.x]],
+    lambdas_ref = ref2[[.x]],
+    df_allele = alleleCounts2[[.x]],
+    genome = "hg38",
+    out_dir = paste0(outdir,LN_ID[[.x]]),
+    t = 1e-06, 
+    gamma = 20,
+    min_cells = 30, 
+    min_depth = 0,
+    multi_allelic = T,
+    tau = 0.25,
+    ncores = 4,
+    ncores_nni = 4
+  )
+)
+```
+
+### Benchmark 3
+
+-   reference from rLN? needs to be same anno?
+
+## Results
+
+**Import numbat results**
+
+```{r}
+#| label: result_import
+
+# initialize numbat class
+dir1 = paste0("rdata/numbat/benchmark1/",LN_ID)
+nbResults1 = lapply(dir1, Numbat$new)
+names(nbResults1) = LN_ID
+
+dir2 = paste0("rdata/numbat/benchmark2/",LN_ID)
+nbResults2 = lapply(dir2, Numbat$new)
+names(nbResults2) = LN_ID
+```
+
+### Compare pseudobulked clones (output of `run_numbat`)
+
+```{r}
+#| label: pseudobulked_clones
+#| layout-ncol: 1
+#| eval: true
+#| fig-subcap:
+#|  - "LN0025, bench. 1"
+#|  - "LN0025, bench. 2"
+#|  - "LN0177, bench. 1"
+#|  - "LN0177, bench. 2"
+#|  - "LN0193, bench. 1"
+#|  - "LN0193, bench. 2"
+#|  - "LN0438, bench. 1"
+#|  - "LN0438, bench. 2"
+
+# need absolute paths!
+LN_ID = c("LN0025","LN0177","LN0193","LN0438")
+plotpaths = purrr::map(
+  LN_ID, 
+  ~ file.path(
+    here::here(),
+    paste0("rdata/numbat/benchmark", c(1,2)),
+    .x,
+    "bulk_clones_final.png"
+  )
+)
+
+# lapply didn't work here
+knitr::include_graphics(plotpaths[[1]])
+knitr::include_graphics(plotpaths[[2]])
+knitr::include_graphics(plotpaths[[3]])
+knitr::include_graphics(plotpaths[[4]])
+```
+
+-   With the exception of LN0025, there were no major differences between benchmark 1 and 2.
+-   Continued the rest of the analysis with benchmark 2 because more cells were included in analysis (ie - mitotic and singletons).
+
+### Single cell posterior probabilities for each CNV
+
+\[\[TO DO: add more detail + plots, or remove\]\]
+
+-   p_cnv: etc
+
+```{r}
+#| label: cnv_post_prob
+
+# get current joint_post
+jointPost = lapply(
+  nbResults2, 
+  function(nb) {
+    
+    # get probabilities for each cnv
+    df = as_tibble(nb$joint_post) %>%
+      mutate(cnv = factor(paste0(seg,"_",cnv_state))) %>%
+      # select(
+      #   cell,cnv,cnv_state,LLR,
+      #   CHROM,seg_start,seg_end,
+      #   n_genes,n_snp,
+      #   p_cnv,p_cnv_x,p_cnv_y
+      # )
+
+    return(df)
+  }
+)
+
+# add cell annotation
+jointPost = lapply(
+  seq_along(jointPost), 
+  function(x) {
+    # get cell anno
+    cellanno = tibble(
+      cell = rownames(meta),
+      major_type = meta$major_type,
+      prelim_anno = meta$prelim_anno,
+      tricycle = meta$tricycle
+    )
+    
+    df = left_join(jointPost[[x]], cellanno, by = "cell")
+    return(df)
+  }
+)
+
+
+# test plot, B cells only
+jointPost[[3]] %>%
+  filter(
+    #major_type %in% c("T"),
+    cnv_state != "loh",
+    LLR > 10
+  ) %>%
+  mutate(bcl2 = if_else(grepl("BCL2.hi", prelim_anno),"hi","lo")) %>%
+  ggplot(., aes(p_neu)) +
+  #geom_density() +
+  geom_density(aes(color = major_type)) +
+  facet_wrap(vars(cnv), scales = "free")
+```
+
+### Genotypes of clones
+
+TO DO:
+
+-   change levels to include type of mutation!!
+-   re order levels, change color code!! resize ggplot
+
+```{r}
+#| label: genotype_clones
+
+# default results ----
+## get clone info
+clonePost = lapply(
+  nbResults2,
+  function(nb) {
+    df = nb$clone_post
+    return(df)
+  }
+)
+
+clones = do.call(rbind,clonePost)
+
+## checked order first all(clones$cell == rownames(embeds))
+clones = cbind(clones, embeds)
+clones = cbind(clones, meta)
+
+## genotype color code
+# gtColor = hcl.colors(n = 4, "Spectral")
+
+## generate random order for plotting
+cloneplot1 = clones[sample(1:nrow(clones), nrow(clones), replace = F),] %>%
+  ggplot(., aes(wnnUMAP_1, wnnUMAP_2))+
+  geom_jitter(
+    aes(color = factor(clone_opt)), 
+    size = 0.05, 
+    alpha = 0.5
+  )+
+  theme_umap() +
+  scale_color_manual(values = c("#edede9","#e76f51"))+
+  labs(color = "Genotype") +
+  facet_grid(cols = vars(orig.ident))
+
+ggsave(
+  paste0("figures/",format(Sys.time(),"%y%m%d"),"_NumbatClonesK1.png"),
+  cloneplot1, width = 8, height = 4
+)
+
+# recut tree (k = 2) to see if subclones resolve ----
+## this will change the numbat benchmark2 dir
+nb_k2 = lapply(
+  nbResults2,
+  function(nb){
+    
+    # get 3 groups from 2 cuts
+    nb$cutree(n_cut = 2)
+    return(nb)
+  }
+)
+
+## get clone info
+clonePost_k2 = lapply(
+  nb_k2,
+  function(nb) {
+    df = nb$clone_post
+    return(df)
+  }
+)
+
+clones_k2 = do.call(rbind,clonePost_k2)
+
+## checked order first all(clones$cell == rownames(embeds))
+clones_k2 = cbind(clones_k2, embeds)
+clones_k2 = cbind(clones_k2,meta)
+
+## genotype color code
+#gtColor = hcl.colors(n = 8, "Zissou")
+
+## random order for plotting
+cloneplot2 = clones_k2[sample(1:nrow(clones_k2), nrow(clones_k2), replace = F),] %>%
+  ggplot(., aes(wnnUMAP_1, wnnUMAP_2))+
+  geom_jitter(
+    aes(color = factor(clone_opt)), 
+    size = 0.05, 
+    alpha = 0.5
+  )+
+  theme_umap() +
+  scale_color_manual(values = c("#edede9","#e76f51","#2a9d8f"))+
+  labs(color = "Genotype") +
+  facet_grid(cols = vars(orig.ident))
+
+ggsave(
+  paste0("figures/",format(Sys.time(),"%y%m%d"),"_NumbatClonesK2.png"),
+  cloneplot2, width = 6, height = 3
+)
+```
+
+```{r}
+#| label: genotypes_plot
+#| eval: true
+#| layout-ncol: 1
+#| fig-subcap:
+#|  - "Genotypes, ncut k: 1"
+#|  - "Genotypes, ncut k: 2"
+
+path = list.files(
+  path = here::here(),
+  pattern = "NumbatClones",
+  recursive = T,
+  full.names = T
+)
+
+knitr::include_graphics(path[[1]])
+knitr::include_graphics(path[[2]])
+```
+
+-   More background in T cells when forcing k = 2 (except possibly for LN0177)
+
+**Probability of calls**
+
+-   p_opt: Maximum a posteriori clone probability
+
+```{r}
+# TO DO MOVE
+# probability of clone call
+clones_k2[sample(1:nrow(clones_k2), nrow(clones_k2), replace = F),] %>%
+  ggplot(., aes(wnnUMAP_1, wnnUMAP_2))+
+  geom_jitter(
+    aes(color = p_opt), 
+    size = 0.05, 
+    alpha = 0.5
+  )+
+  scale_color_viridis_c(option = "magma", end = 0.85) +
+  theme_umap() +
+  facet_grid(cols = vars(orig.ident),
+             rows = vars(clone_opt))
+```
+
+**Tumor vs non-tumor calls**
+
+TO DO:
+
+-   update with updated GT with type of CNV
+
+```{r}
+#| label: tumor_cell_calls
+# checked same order w/ all()
+tumorCalls = tibble(
+  compartment_k1 = clones$compartment_opt,
+  gt_k1 = clones$GT_opt,
+  clone_k1 = clones$clone_opt,
+  compartment_k2 = clones_k2$compartment_opt,
+  gt_k2 = clones_k2$GT_opt,
+  clone_k2 = clones_k2$clone_opt,
+  major_type = meta$major_type,
+  prelim_anno = meta$prelim_anno,
+  orig.ident = meta$orig.ident
+)
+
+# pivot
+tumorCalls = pivot_longer(
+  tumorCalls,
+  cols = names(tumorCalls)[grep("compartment",names(tumorCalls))],
+  names_to = "k",
+  values_to = "call"
+)
+
+# remove "compartment" in name
+tumorCalls$k = gsub("compartment_","",tumorCalls$k)
+
+# calculate proportion
+propTumor = tumorCalls %>%
+  group_by(orig.ident, k, major_type, call) %>%
+  tally() %>%
+  ungroup(call) %>%
+  mutate(prop = n / sum(n))
+  
+propTumorplot = ggplot(propTumor, aes(k, prop))+
+  geom_col(aes(fill = call)) +
+  facet_grid(rows = vars(orig.ident),
+             cols = vars(major_type)) +
+  scale_fill_manual(values = c("grey","#e76f51")) +
+  theme_bw()
+
+ggsave(
+  paste0("figures/",format(Sys.time(),"%y%m%d"),"_tumorcallprop_vs_k.png"),
+  propTumorplot, width = 6, height = 6
+)
+
+# TO DO: geom_count version
+```
+
+TO DO: more systematic way of taking all benchmark, compare n cut 1 vs 2, then assess clones
+
+## Annotate cells
+
+-   For now, annotate cells
+-   LN0025: k=1
+-   LN0177: k=2
+-   LN0193: k=1
+-   LN0438: k=2
+
+```{r}
+#| label: annotation
+
+# to do: more elegant way
+anno = rbind(clonePost[[1]],clonePost_k2[[2]],clonePost[[3]],clonePost_k2[[4]], fill = T)
+
+# check with all(rownames(meta) == anno$cell)
+meta$numbat.clone_opt = anno$clone_opt
+meta$numbat.GT_opt = anno$GT_opt
+meta$numbat.compartment_opt = anno$compartment_opt
+meta$numbat.p_opt = anno$p_opt
+
+# update wnn
+wnn@meta.data = meta
+qs::qsave(wnn, "rdata/03.XX2_wnn.qs", nthreads = 16)
+qs::qsave(anno, "rdata/03.XX2_cloneAnnoInfo.qs", nthreads = 16)
+```
+
+Genotype information
+
+```{r}
+
+```
+
+## Session Info
+
+```{r}
+#| label: sessioninfo
+#| eval: true
+sessionInfo()
+```
+
+## References
+
+-   original publication: <https://www.nature.com/articles/s41587-022-01468-y>
+-   <https://kharchenkolab.github.io/numbat/articles/numbat.html>

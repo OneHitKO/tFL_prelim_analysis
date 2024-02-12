@@ -1,0 +1,542 @@
+---
+title: "WNN integration of modalities"
+---
+
+**Libraries**
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(furrr)
+library(reticulate)
+library(ggalluvial)
+#library(Azimuth)
+#library(SeuratData)
+#library(tonsilref.SeuratData)
+
+# always set seed!!!
+set.seed(105)
+
+#source("ggplot_custom/themes.R")
+
+# set python
+use_virtualenv("~/composite/analysis/old_scripts/sc_py_env")
+```
+
+**Import Data**
+
+```{r}
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+atac_integrated = qs::qread("rdata/02_02_atac_integrated.qs")
+gex_integrated = qs::qread("rdata/02_01_gex.qs")
+```
+
+### Add modalities together
+
+```{r}
+# set default assays
+DefaultAssay(gex_integrated) = "RNA"
+DefaultAssay(atac_integrated) = "ATAC"
+
+# add assays to gex ---- (does order matter?!)
+gex_integrated[["ATAC"]] = atac_integrated[["ATAC"]]
+gex_integrated[["GeneScoreImputed"]] = atac_integrated[["GeneScoreImputed"]]
+
+# transfer embeddings ---- (does order matter?!)
+gex_integrated[["atacUMAP"]] = CreateDimReducObject(
+  embeddings = Embeddings(atac_integrated@reductions$atacUMAP),
+  assay = "ATAC",
+  key = "atacUMAP_"
+)
+
+gex_integrated[["integratedLSI"]] = CreateDimReducObject(
+  embeddings = Embeddings(atac_integrated@reductions$integrated_lsi),
+  assay = "ATAC",
+  key = "integratedLSI_"
+)
+
+# update name of obj ----
+integrated = gex_integrated
+
+
+# add atac meta.data ----
+# match order to integrated! not the same! 
+ord = match(Cells(integrated),Cells(atac_integrated))
+atacmeta = atac_integrated@meta.data[ord,]
+
+# rm unnecessary cols, redundant
+atacmeta = select(
+  atacmeta, 
+  !c("orig.ident","LSI2res0.75","LSI4res0.75","nCount_ATAC","nFeature_ATAC")
+)
+
+# checked with all(rownames(atacmeta) == Cells(integrated))
+newmeta = cbind(integrated@meta.data,atacmeta)
+
+# update metadata
+integrated@meta.data = newmeta
+
+# rm to save space
+rm(atac_integrated, gex_integrated)
+
+# join layers
+integrated = JoinLayers(integrated)
+```
+
+## Weighted Nearest Neighbors
+
+-   Notes on clustering (recommendation to do in PCA space, not UMAP: <https://github.com/satijalab/seurat/issues/1081>)
+-   Set k.nn = 30 to match n.neighbors in `RunUMAP`
+-   Tested all gex PCA reduction!
+
+TO DO: benchmark with different k.nn, default was not enough
+
+```{r}
+#| label: findneighbors
+
+# get integrated PCAs
+allpca = names(integrated@reductions)[grepl("PCA",names(integrated@reductions))]
+intpca= allpca[grepl("cca|rpca|joint|h",allpca)]
+
+# wnn + umap
+for (i in seq_along(intpca)){
+  prefix = intpca[[i]]
+  
+  # find wnn
+  integrated = FindMultiModalNeighbors(
+    integrated,
+    reduction.list = list(prefix,"integratedLSI"),
+    dims.list = list(1:30,2:50),
+    k.nn = 30,
+    knn.graph.name = paste0(prefix,".wknn"),
+    snn.graph.name = paste0(prefix,".wsnn"),
+    weighted.nn.name = paste0(prefix,".weighted.nn")
+  )
+  
+  # umap
+  integrated = RunUMAP(
+    integrated, 
+    nn.name = paste0(prefix,".weighted.nn"), 
+    reduction.name = paste0(prefix,".wnnUMAP"), 
+    reduction.key = paste0(prefix,"wnnUMAP_"),
+    n.neighbors = 30L
+  )
+}
+```
+
+**Plot UMAPs**
+
+```{r}
+#| label: plot_wnnUMAPs
+
+allwnnumaps = Reductions(integrated)[grepl("wnnUMAP",Reductions(integrated))]
+
+# get embeddings 
+embedall = map(
+  allwnnumaps,
+  ~ Embeddings(integrated, .x) %>%
+    as_tibble(rownames = "cell_id") %>%
+    rename(wnnUMAP_1 = 2, wnnUMAP_2 = 3) %>%
+    mutate(umap = .x, sample = integrated$Sample)
+)
+
+embedall = do.call(rbind, embedall)
+
+# order umap levels
+embedall$umap = factor(
+  embedall$umap,
+  levels = c(
+    "cca.rnaPCA.wnnUMAP",
+    "rpca.rnaPCA.wnnUMAP",
+    "joint.rnaPCA.wnnUMAP",
+    "h.rnaPCA.wnnUMAP",
+    "cca.sctPCA.wnnUMAP",
+    "rpca.sctPCA.wnnUMAP",
+    "joint.sctPCA.wnnUMAP",
+    "h.sctPCA.wnnUMAP"
+  )
+)
+
+# plot
+pl = ggplot(embedall, aes(wnnUMAP_1, wnnUMAP_2))+
+  geom_jitter(aes(color = sample), size = 0.01, alpha = 0.25) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3, panel.grid = element_blank())+
+  facet_wrap(vars(umap), ncol = 4)
+
+ggsave("figures/02/04_allwnnUMAPs.png",pl,width = 12, height = 8)
+```
+
+**Feature Plots**
+
+TO DO
+
+```{r}
+
+# set default assay to plot lognorm counts
+DefaultAssay(integrated) = "RNA"
+
+genes = c("MS4A1","BCL2","MYC","CD3D","TRAC","CD8A")
+
+# feature plot
+ featpl = FeaturePlot(
+   wnn,
+   reduction = "wnnUMAP",
+   pt.size = 0.01,
+   features = c("PAX5","BCL2"),
+   blend = T
+ )
+ 
+ ggsave("figures/02/04_wnnUMAP_pax5bcl2_lognormRNAcounts.png", featpl, height = 2.5, width = 9)
+```
+
+### Clustering
+
+-   Use only one resolution (1) because can find subclusters later
+-   Compared clustering based using wsnn `rpca.rnaPCA, rpca.sctPCA`
+
+```{r}
+#| label: clustering
+
+prefix = c("rpca.rnaPCA.","rpca.sctPCA.")
+
+for (i in prefix){
+  integrated = FindClusters(
+    integrated,
+    resolution = 1,
+    graph.name = paste0(i,"wsnn"),
+    cluster.name = paste0(i,"wsnn_clst"),
+    algorithm = 4,
+    method = "igraph",
+    random.seed = 1,
+    group.singletons = T,
+    verbose = F
+  )
+}
+
+qs::qsave(integrated, "rdata/02_04_integrated.qs", nthreads = 32)
+
+# DimPlot to compare
+wnn1 = DimPlot(
+  integrated, 
+  reduction = "rpca.rnaPCA.wnnUMAP", 
+  group.by = "rpca.rnaPCA.wsnn_clst", 
+  label = T, 
+  pt.size = 0.1, 
+  label.size = 3
+)
+
+wnn2 = DimPlot(
+  integrated, 
+  reduction = "rpca.sctPCA.wnnUMAP", 
+  group.by = "rpca.sctPCA.wsnn_clst", 
+  label = T, 
+  pt.size = 0.1, 
+  label.size = 3
+)
+
+ggsave("figures/02/04_clustering_compare_umap.png", wnn1+wnn2, height = 4, width = 11)
+```
+
+### Module score
+
+-   cluster based on rpca.pcaRNA.wsnn_clst (more B cell clusters)
+-   used module score for quick assessment
+-   used the following RNA signatures:
+    -   B cells = MS4A1, PAX5
+    -   T cells = CD3E, CD3D
+    -   NK = KLRD1, NCAM1
+    -   pDC = IL3RA, CLEC4C
+    -   myeloid = LYZ, CST3, SLC8A1
+
+```{r}
+#| label: module_score
+
+Bmarkers = c("MS4A1","PAX5") #immune1
+Tmarkers = c("CD3E","CD3D") #immune2
+NK = c("KLRD1","NCAM1") #immune3
+pDC = c("IL3RA","CLEC4C") #immune4
+myeloid = c("LYZ","CST3","SLC8A1") #immune5
+
+
+# perform on slimmed object
+tFL_RNA = DietSeurat(integrated, assay = "RNA",  dimreducs = "rpca.rnaPCA.wnnUMAP")
+
+tFL_RNA = AddModuleScore(
+  tFL_RNA,
+  features = list(Bmarkers,Tmarkers,NK,pDC,myeloid),
+  slot = "data",
+  name = "immune"
+)
+
+# plot quick scatter to assign major types
+tFL_RNA@meta.data %>%
+  ggplot(.,aes(immune2, immune3))+
+  geom_jitter(aes(color=rpca.rnaPCA.wsnn_clst), size = 0.1, alpha=0.5) +
+  facet_wrap(vars(rpca.rnaPCA.wsnn_clst))
+```
+
+**Other Feature Plots to help**
+
+```{r}
+DefaultAssay(integrated) ="GeneScoreImputed"
+FeaturePlot(integrated, features = "CD8A", reduction = "rpca.rnaPCA.wnnUMAP")
+
+# combining different assays
+FeaturePlot(
+  integrated, 
+  features = c("SELL","genescoreimputed_CD4"),
+  blend=T,
+  reduction = "rpca.rnaPCA.wnnUMAP"
+)
+```
+
+### Note on subclustering
+
+-   Noticed that cluster 3 and 1 can be 2 different clusters in `rpca.rnaPCA.wsnn_clst`.
+-   Tried to subcluster, but did not separate on UMAP. Can resolve later
+
+```{r, include = F, eval = F}
+
+# test subclustering
+Idents(integrated) = "rpca.rnaPCA.wsnn_clst"
+DefaultAssay(integrated) = "RNA"
+
+tFL_RNA = FindSubCluster(
+  integrated,
+  cluster = c("3","1"),
+  graph.name = "rpca.rnaPCA.wsnn",
+  subcluster.name = "sub.cluster",
+  resolution = 0.1,
+  algorithm = 4
+)
+
+DimPlot(tFL_RNA, reduction = "rpca.rnaPCA.wnnUMAP", group.by = "sub.cluster")
+```
+
+### Major type assignment
+
+-   Use cluster results of `rpca.rnaPCA.wsnn_clst`
+
+```{r}
+# set idents
+Idents(integrated) = "rpca.rnaPCA.wsnn_clst"
+
+# set levels
+Bcells = c(
+  "12" = "B_sub1",
+  "9" = "B_sub2",
+  "5" = "B_sub3",
+  "7" = "B_sub4",
+  "20" = "B_sub5",
+  "8" = "B_sub6",
+  "22" = "B_sub7",
+  "19" = "B_sub8",
+  "4" = "B_sub9",
+  "16" = "B_sub10"
+)
+
+Tcells = c(
+  "10" = "T_sub1",
+  "2" = "T_sub2",
+  "6" = "T_sub3",
+  "11" = "T_sub4",
+  "3" = "T_sub5",
+  "1" = "T_sub6",
+  "13" = "T_sub7",
+  "17" = "T_sub8",
+  "15" = "T_sub9",
+  "14" = "T_sub10",
+  "18" = "T_sub11"
+)
+
+other = c(
+  "23" = "NK",
+  "21" = "pDC",
+  "25" = "myeloid",
+  "24" = "doublets"
+)
+
+# relevel, rename
+levels(integrated) = c(names(Bcells),names(Tcells),names(other))
+integrated = RenameIdents(integrated, c(Bcells,Tcells,other))
+
+# add to meta
+integrated$prelim_anno = Idents(integrated)
+
+# quick viz
+DimPlot(integrated, reduction = "rpca.rnaPCA.wnnUMAP")
+```
+
+**UMAP final**
+
+```{r}
+# get embeddings from umap of interest
+
+## TO DO: save
+DimPlot(
+  integrated,
+  reduction = "rpca.rnaPCA.wnnUMAP", 
+  label = F, label.size = 4, repel = T, alpha = 0.5,
+  group.by = "Sample",
+  #cols = "Dark2",
+  shuffle = T
+) +
+  theme(#legend.position = "none",
+        aspect.ratio = 3/3) +
+  labs(x="wnnUMAP_1", y ="wnnUMAP_2")
+```
+
+**Save**
+
+```{r}
+qs::qsave(integrated,"rdata/02_04_integrated.qs", nthreads = 32)
+```
+
+## Annotation
+
+### **Quick Find All Markers (move to different script?)**
+
+-   TO DO: test all tests! check libra
+-   Performed on B and T cells separately
+
+```{r}
+# b cells
+Bcell_sub = integrated[,integrated$prelim_anno %in% Bcells]
+
+B_allMarkers = FindAllMarkers(
+  Bcell_sub,
+  assay = "RNA",
+  logfc.threshold = 0.6,
+  test.use = "wilcox",
+  min.pct = 0.4,
+  only.pos = T
+)
+
+# T cells
+Tcell_sub = integrated[,integrated$prelim_anno %in% Tcells]
+
+T_allMarkers = FindAllMarkers(
+  Tcell_sub,
+  assay = "RNA",
+  logfc.threshold = 0.6,
+  test.use = "wilcox",
+  min.pct = 0.4,
+  only.pos = T
+)
+```
+
+**Plot**
+
+B cells
+
+```{r}
+# take top 5 from each
+topB = B_allMarkers %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  mutate(gene = fct_reorder2(gene,cluster,avg_log2FC))
+
+# TO DO: Save in ggplot
+DotPlot(
+  Bcell_sub, 
+  features = unique(topB$gene),
+  scale = F
+)+
+  RotatedAxis() +
+  scale_y_discrete(limits=rev) +
+  scale_color_viridis_c(option = "plasma", end = 0.85) + 
+  theme(axis.text.x = element_text(size = 10))
+```
+
+T cells
+
+```{r}
+# take top 5 from each
+topT = T_allMarkers %>%
+  filter(p_val_adj < 0.01) %>%
+  group_by(cluster) %>%
+  arrange(desc(avg_log2FC)) %>%
+  slice_head(n = 5) %>%
+  mutate(gene = fct_reorder2(gene,cluster,avg_log2FC))
+
+# TO DO: save in ggplot
+DotPlot(
+  Tcell_sub, 
+  features = unique(topT$gene),
+  scale = F
+)+
+  RotatedAxis() +
+  scale_y_discrete(limits=rev) +
+  scale_color_viridis_c(option = "plasma", end = 0.85) + 
+  theme(axis.text.x = element_text(size = 10))
+```
+
+### Relevel
+
+```{r}
+Tcells = c(
+  "T_sub1"="T_naive",
+  "T_sub2",
+  "T_sub3",
+  "T_sub4",
+  "T_sub5",
+  "T_sub6",
+  "T_sub7",
+  "17" = "T_sub8",
+  "15" = "T_sub9",
+  "14" = "T_sub10",
+  "18" = "T_sub11"
+)
+
+
+```
+
+### To Troubleshoot/delete: Quick Annotation w label transfer of tonsil ref data
+
+-   problem with Seurat V5 data type
+
+```{r}
+#| label: label_w_tonsilref
+tonsilref = readRDS("/g/scb/zaugg/kou/R-lib/4.2.2-foss-2022b/tonsilref.SeuratData/azimuth/ref.Rds")
+#tonsilref = UpdateSeuratObject(tonsilref)
+
+# # keep GEX only
+# tFL_RNA = DietSeurat(
+#   integrated, 
+#   assays = c("RNA","SCT"),
+#   dimreducs = c("rpca.rnaPCA","rpca.sctPC","rpca.rnaPCA.wnnUMAP","rpca.sctPCA.wnnUMAP")
+# )
+
+DefaultAssay(tFL_RNA) = "RNA"
+
+tFL_RNA = as(object = integrated[["RNA"]], Class = "Assay")
+#tFL_RNA = JoinLayers(tFL_RNA)
+#tFL_RNA = FindVariableFeatures(tFL_RNA, layer = "data")
+
+# map w azimuth
+tFL_RNA = RunAzimuth(tFL_RNA, reference = "tonsilref", assay = "RNA")
+```
+
+**Alluvial Plot to compare clusters**
+
+```{r}
+#| label: alluvial
+
+# make df
+clustsummary = as_tibble(integrated@meta.data, rownames = "cell_id") %>%
+  group_by(rpca.rnaPCA.wsnn_clst,rpca.sctPCA.wsnn_clst) %>%
+  count(.) %>%
+  mutate(
+    rpca.rnaPCA.wsnn_clst = fct_reorder(rpca.rnaPCA.wsnn_clst,n),
+    rpca.sctPCA.wsnn_clst = fct_reorder(rpca.sctPCA.wsnn_clst,n)
+  )
+
+# plot alluvial
+ggplot(clustsummary, aes(y = n, axis1= rpca.rnaPCA.wsnn_clst, axis2 = rpca.sctPCA.wsnn_clst)) +
+  geom_alluvium(aes(fill = rpca.rnaPCA.wsnn_clst), width = 0.15) +
+  geom_stratum(width = 0.15, fill = "white", color = "black")
+```

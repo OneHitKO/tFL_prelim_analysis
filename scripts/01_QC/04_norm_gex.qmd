@@ -1,0 +1,579 @@
+---
+title: "GEX Normalization"
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(tricycle)
+library(shiny)
+library(clustree)
+library(reticulate)
+library(furrr)
+library(future.apply)
+
+# always set seed!
+set.seed(105)
+
+# put in R profile? source it?
+plan(
+  list(
+    tweak(multisession, workers = availableCores() %/% 4),
+    sequential
+  )
+)
+
+options(future.globals.maxSize= 2000*1024^2)
+
+# TO DO: TEST CONDA ENV WITHOUT plan() above!
+
+# .Rprofile unsets default system RETICULATE_PYHON and PYTHONPATH
+# load env with leidenalg
+use_virtualenv("old_scripts/sc_py_env")
+```
+
+```{r}
+# import
+# object was merged during filtering to match cells kept after QC step in ATAC-seq
+# it is already split as sample specific RNA layers are preserved
+# SplitObject() returns list! split() returns seurat obj. just fyi! 
+split = qs::qread("rdata/01_03_seur_keep.qs")
+```
+
+**TO DO at some point**
+
+-   update code so don't need to map; i think seurat updated so each function runs through each element of split obj prior to integration due to different layers
+
+### Goals:
+
+-   Perform 2 different approaches of normalization, both BEFORE merging data sets:
+    -   log-normalize/scale
+    -   SCTransform
+-   This preprint demonstrated that normalization before merging always outperforms normalization after merging (<https://www.biorxiv.org/content/10.1101/2021.08.18.456898v1.full.pdf>, figure 5).
+-   Additional notes on when to merge datasets (before/after SCTransform):
+    -   <https://www.biostars.org/p/9516696/>
+    -   <https://satijalab.org/seurat/articles/integration_introduction.html>
+
+## 1. Log-Normalizing & Scaling RNA counts
+
+-   Normalization (from Seurat vignette):
+    -   normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result
+-   Scaling (from Seurat vignette):
+    -   Shifts the expression of each gene, so that the mean expression across cells is 0
+    -   Scales the expression of each gene, so that the variance across cells is 1
+    -   Can regress out variables here! Just like in SCTransform
+    -   This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+    -   The results of this are stored in `pbmc[["RNA"]]@scale.data`
+-   Perform prior to adding cell cycle scores to see cell cycle genes (and/or other features like mt ratio) explain unwanted variation
+
+```{r}
+allGenes = rownames(split)
+
+# normalize and find variable features
+split = NormalizeData(
+  split,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000, # default
+  verbose = F
+) %>%
+  FindVariableFeatures(
+    ., 
+    selection.method = "vst", 
+    nfeatures = 2000,
+    verbose = F
+) %>%
+  ScaleData(
+    ., 
+    features = allGenes,
+    verbose = F
+)
+```
+
+### TO DO: MOVE after integration! problems with layers, need to join or integrate
+
+### Adding cell cycle scores
+
+-   After normalizing counts, can add cell cycle score multiple ways
+-   Seurat uses a list generated from Tirosh, et al to separate S genes from G2M genes:(<https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4944528/>)
+-   Other packages like `tricycle` (<https://bioconductor.org/packages/release/bioc/html/tricycle.html>) uses a different gene list that can separate more cell cycle phases. Can compare cell cycle scoring \* "users can approximately relate 0.5pi to be the start of S stage, pi to be the start of G2M stage, 1.5pi to be the middle of M stage, and 1.75pi-0.25pi to be G1/G0 stage."
+-   Also adds cell cycle stages from Schwabe method <https://www.embopress.org/doi/full/10.15252/msb.20209946>
+    -   gene list they used: <https://www.molbiolcell.org/doi/10.1091/mbc.02-02-0030>
+
+```{r addCellCycleGenes, messsage=F, warning=F}
+# UPDATED
+# get seurat gene list
+# ccGenes = cc.genes.updated.2019
+# 
+# split = CellCycleScoring(
+#   split,
+#   g2m.features = ccGenes$g2m.genes,
+#   s.features = ccGenes$s.genes
+# )
+
+# OLD BELOW
+# # add score, which is similar to AddModuleScore()
+# split_seur = future_map(
+#   split_seur, 
+#   ~ CellCycleScoring(
+#     .x,
+#     g2m.features = ccGenes$g2m.genes,
+#     s.features = ccGenes$s.genes
+#   )
+# )
+# 
+# # also add tricycle score
+# # create function
+# add_tri = function(seu_obj){
+#   # get data of active assay
+#   normCounts = GetAssayData(seu_obj, slot = "data")
+#   
+#   # phases are determined by multiples of pi from tricycle method
+#   tricycle_phases = estimate_cycle_position(
+#     normCounts, 
+#     gname.type = "SYMBOL",
+#     species = "human"
+#   )
+#   
+#   # implementation of Schwabe method using RevelioGeneList (see fxn for more details)
+#   schwabe_phases = estimate_Schwabe_stage(
+#     normCounts, 
+#     gname.type = "SYMBOL",
+#     species = "human"
+#   )
+#   
+#   # add to metadata of seuObj
+#   seu_obj$tricycle = tricycle_phases
+#   seu_obj$schwabe_phases = schwabe_phases
+#   
+#   return(seu_obj)
+# }
+# 
+# # add other cell cycle scores
+# split_seur  = future_lapply(split_seur, add_tri)
+```
+
+### PCA Analysis
+
+-   Determine dimensionality of data and maximum number of PCs to use for clustering
+-   Determine features that explain the most variance along a PC (loadings)
+-   Determine if certain covariates (mt ratio, cell cycle, etc) explain variation along top PCs
+    -   These can be regressed out during scaling! (or during SCTransform)
+-   More info: <https://hbctraining.github.io/scRNA-seq/lessons/elbow_plot_metric.html> <https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_SC_SCT_normalization.md>
+
+```{r rnaPCA}
+split = RunPCA(
+  split,
+  npcs = 30,
+  reduction.name = "rnaPCA",
+  verbose = F
+)
+
+pcVar = split[["rnaPCA"]]@stdev / sum(split[["rnaPCA"]]@stdev) * 100
+cumsum = cumsum(pcVar)
+
+whichPC = which(cumsum > 90 & pcVar < 5)[1]
+whichPC
+```
+
+**TO DO: REVISE!\
+Based on PCA results:**
+
+-   Seems like cells do separate based on cell cycle / tricycle scores (PCs 3 and 4, \~ 5% total variation)
+-   Mitochondrial gene ratio didn't seem to have a huge impact on separating samples, but it could be because of previous filtering steps (cutoff = 0.15, maybe too strict?).
+-   Seurat cell cycle regression recommendation: "we suggest regressing out the difference between the G2M and S phase scores. This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase amongst proliferating cells (which are often uninteresting), will be regressed out of the data."
+-   **For this version, will keep ALL cell cycle scores to try to resolve B cell subclusters.**
+
+### Note: Rescaling data with variable regression
+
+-   if you want to regress out variables in future (ratio_mt or cc_diff score), repeat `ScaleData()` with `variables.to.regress` parameter here
+-   need to repeat PCA if so!
+-   for now, did not regress any variables here
+
+### UMAP Reduction
+
+-   create `rnaUMAP` umap embedding from log-normalized and scaled RNA counts (will also create `sctUMAP` later with SCTransfrom normalized RNA counts
+-   use clustree to identify optimal resolution for clustering
+
+```{r UMAP}
+# run UMAP
+split = RunUMAP(
+  split,
+  reduction.name = "rnaUMAP",
+  reduction.key = "rnaUMAP_",
+  reduction = "rnaPCA",
+  dims = 1:whichPC,
+  verbose = F
+)
+
+rnaumap = DimPlot(
+  split, 
+  group.by = "orig.ident",
+  pt.size = 0.01
+) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("figures/01_04_rnaUMAP.png", rnaumap)
+
+# OLD vvv
+# # run UMAP
+# split_seur = map(
+#   split_seur, 
+#   ~ RunUMAP(
+#     .x,
+#     reduction.name = "rnaUMAP",
+#     reduction.key = "rnaUMAP_",
+#     reduction = "rnaPCA",
+#     dims = 1:26,
+#     verbose = F
+#   )
+# )
+```
+
+### TO DELETE? Clustering with log norm RNA
+
+-   use `clustree` program to identify optimal resolution
+-   one node with multiple incoming edges means data is over-clustered
+
+```{r lognorm.clustering}
+
+# find neighbors
+split = FindNeighbors(
+  split,
+  reduction = "rnaPCA",
+  dims = 1:whichPC, # 25 in this analysis
+  verbose = F
+)
+
+# find appropriate resolution using leiden clustering
+test_tree = FindClusters(
+    split,
+    resolution = seq(0.5, 1.25, by = 0.25),
+    algorithm = 4,
+    method = "igraph",
+    random.seed = 1,
+    verbose = F
+)
+
+# plot
+clustree(test_tree@meta.data, prefix = "RNA_snn_res.")
+
+# OLD
+# # find neighbors
+# split_seur = map(
+#   split_seur, 
+#   ~ FindNeighbors(
+#     .x, 
+#     reduction = "rnaPCA",
+#     dims = 1:26,
+#     verbose = F
+#   )
+# )
+# 
+# # find appropriate resolution using leiden clustering
+# test_tree = map(
+#   split_seur, 
+#   ~ FindClusters(
+#     .x,
+#     resolution = seq(0.5, 1.25, by = 0.25),
+#     algorithm = 4,
+#     method = "igraph", 
+#     random.seed = 1,
+#     verbose = F
+#   )
+# )
+# 
+# # plot to see which resolution is the best
+# clustreeplots = lapply(seq_along(test_tree), FUN = function(x){
+#   # get metadata w/ cluster info
+#   df = test_tree[[x]]@meta.data
+#   
+#   # speficy columns with cluster info
+#   clustree(df, prefix = "RNA_snn_res.")+
+#     labs(title = names(test_tree)[[x]])
+#   }
+# )
+# 
+# clstplot = cowplot::plot_grid(plotlist = clustreeplots)
+# 
+# ggsave("figures/01_04_clustreeResults.png", width = 12, height = 16)
+```
+
+**Notes on Resolution**
+
+-   Doesn't matter what to choose at the moment, since clustering will be repeated after SCT normalization / merging.
+-   For now, used 0.75 as it was relatively stable (can vizualize `sc3_stability` as node color when plotting clustree results)
+
+```{r final.cluster.lognorm}
+# repeat clustering
+split_seur = map(
+  split_seur,
+  ~ FindClusters(
+    .x,
+    resolution = 0.75,
+    algorithm = "4",
+    method = "igraph",
+    random.seed = 1,
+    verbose = F
+  )
+)
+```
+
+### TO DO: Plot UMAP from log-normalized RNA
+
+```{r plot.rnaUMAP}
+# quick plot
+rnaUMAP = lapply(seq_along(split_seur), function(x){
+  DimPlot(
+    split_seur[[x]],
+    reduction = "rnaUMAP", 
+    group.by = "RNA_snn_res.0.75",
+    pt.size = 0.01,
+    label.size = 3,
+    label = T
+    ) +
+    theme(aspect.ratio = 3/3, legend.position = "none") +
+    labs(title = names(split_seur)[[x]])
+  }
+)
+
+rnaUMAP = cowplot::plot_grid(plotlist = rnaUMAP)
+
+ggsave("figures/01_04_rnaUMAP.png",rnaUMAP, height = 6, width = 8)
+
+rnaUMAP
+```
+
+```{r plot.rnaUMAP.ms4a1}
+# quick plot
+rnaUMAP_ms4a1 = lapply(seq_along(split_seur), function(x){
+  FeaturePlot(
+    split_seur[[x]], 
+    features = c("MS4A1","BCL2"),
+    slot = "data",
+    reduction = "rnaUMAP",
+    pt.size = 0.001,
+    label.size = 3,
+    max.cutoff = "q99",
+    alpha = 0.75,
+    blend = T,
+    label = T
+    ) +
+    theme(aspect.ratio = 3/3)
+  }
+)
+
+# have to run immediate after the previous code, otherwise error with globs
+rnaUMAP_ms4a1 = cowplot::plot_grid(
+  plotlist = rnaUMAP_ms4a1, ncol = 1,
+  labels = names(split_seur)
+)
+
+ggsave("figures/01_04_rnaUMAP_Bcells.png",rnaUMAP_ms4a1, height = 16, width = 12)
+```
+
+```{r plot.tcells}
+rnaUMAP_trac = lapply(seq_along(split_seur), function(x){
+  FeaturePlot(
+    split_seur[[x]], 
+    features = c("TRAC","CD8A"),
+    slot = "data",
+    reduction = "rnaUMAP",
+    pt.size = 0.001,
+    alpha = 0.75,
+    label.size = 3,
+    blend = T,
+    label = T,
+    max.cutoff = "q99"
+    ) +
+    theme(aspect.ratio = 3/3)
+  }
+)
+
+# have to run immediate after the previous code, otherwise error with globs
+rnaUMAP_trac = cowplot::plot_grid(
+  plotlist = rnaUMAP_trac, ncol = 1,
+  labels = names(split_seur)
+)
+
+ggsave("figures/01_04_rnaUMAP_Tcells.png",rnaUMAP_trac, height = 16, width = 12)
+```
+
+## 2. Normalize by SCTransform
+
+-   In this version, did NOT regress out any variable
+-   "SCT" assay is added to seurat object. log-normalized RNA can still be accessed in "RNA" assay
+
+```{r SCTransform}
+# normalize
+split = SCTransform(
+ split,
+ vst.flavor = "v2",
+ residual.features = NULL,
+ return.only.var.genes = F
+)
+
+# run PCA
+split = RunPCA(
+  split,
+  npcs = 30,
+  reduction.name = "sctPCA",
+  reduction.key = "sctPC_",
+  verbose = F
+)
+
+# determine dimensionality
+pcVar = split[["sctPCA"]]@stdev / sum(split[["sctPCA"]]@stdev) * 100
+cumsum = cumsum(pcVar)
+
+whichPC = which(cumsum > 90 & pcVar < 5)[1]
+whichPC
+
+# run UMAP
+split = RunUMAP(
+  split,
+  reduction.name = "sctUMAP",
+  reduction.key = "sctUMAP_",
+  reduction = "sctPCA",
+  dims = 1:whichPC,
+  verbose = F
+)
+
+qs::qsave(split,"rdata/01_04_sctsplit.qs", nthreads = 16)
+```
+
+**Plot features here**
+
+```{r}
+sctumap = DimPlot(split, reduction = "sctUMAP", pt.size = 0.01)
+sctumapbydonors = DimPlot(split, reduction = "sctUMAP", 
+                          pt.size = 0.01,split.by = "orig.ident")
+
+
+ggsave("figures/01_04_sctUMAP.png", sctumap, height =4,width = 4)
+ggsave("figures/01_04_sctUMAPbyDonors.png", sctumapbydonors, height = 4, width = 9)
+```
+
+## TO DELETE everything VVV
+
+```{r}
+# OLD vvv
+# # DID NOT regress out cc_diff score
+# # use all genes (residual.features=NULL) to calc residuals
+# split_seur = map(
+#   split_seur, 
+#   ~ SCTransform(
+#     .x,
+#     vst.flavor = "v2",
+#     residual.features = NULL,
+#     return.only.var.genes = F
+#   )
+# )
+```
+
+### TO DELETE: combined into previous chunk
+
+### PCA analysis with SCTransformed counts
+
+```{r sctPCA}
+# OLD TO DELETE
+# # redo PCA w/ SCT assay
+# split_seur = map(
+#   split_seur, 
+#   ~ RunPCA(
+#     .x,
+#     npcs = 30,
+#     reduction.name = "sctPCA",
+#     reduction.key = "sctPC_",
+#     verbose = F
+#   )
+# )
+# 
+# # see % variance for each pc in sctPCA dimen reduc obj
+# sct_pcVar = lapply(split_seur, function(seuObj){
+#   pct = seuObj[["sctPCA"]]@stdev / sum(seuObj[["sctPCA"]]@stdev) * 100
+#   return(pct)
+#   }
+# )
+# 
+# # get cumulative sums to quantitatively determine dimensionality
+# sct_cumsum = lapply(sct_pcVar, cumsum)
+# 
+# # determine the first PC that has cum variance of 90%, but explains less than 5% (use for umap) 
+# whichPC = map2(sct_pcVar, sct_cumsum, ~ which(.y > 90 & .x < 5)[1])
+# whichPC
+```
+
+### TO DELETE: sctUMAP
+
+-   use "sctPCA" and dims 1:27
+
+```{r sctUMAP}
+# OLD 
+# split_seur = map(
+#   split_seur, 
+#   ~ RunUMAP(
+#     .x,
+#     reduction.name = "sctUMAP",
+#     reduction.key = "sctUMAP_",
+#     reduction = "sctPCA",
+#     dims = 1:27,
+#     verbose = F
+#   )
+# )
+```
+
+### Clustering with sctPCA
+
+```{r sct.clustering, include=T}
+# find neighbors and clusters for visualization, use different resolutions
+split_sct = map(split_sct, ~ FindNeighbors(.x,
+                                           reduction = "sctPCA", 
+                                           dims = 1:27,
+                                           verbose = FALSE))
+
+# find appropriate resolution using leiden clustering
+# make sure default assay is SCT! 
+test_tree2 = map(split_sct, ~ FindClusters(.x,
+                                           resolution = seq(0.25, 1.5, by = 0.25),
+                                           algorithm = "4",
+                                           method = "igraph", 
+                                           random.seed = 1,
+                                           verbose = F))
+
+# plot to see which resolution is the best
+lapply(1:4, FUN = function(x){
+  # get metadata w/ cluster info
+  df = test_tree2[[x]]@meta.data
+  
+  # speficy columns with cluster info
+  clustree(df, prefix = "SCT_snn_res.")+
+    labs(title = names(test_tree2)[[x]])
+})
+```
+
+**Resolution results of Clustree**
+
+-   LN0025: 0.5
+-   LN0177: 0.5
+-   LN0193: 0.5
+-   LN0438: 0.5
+
+```{r final.cluster.sct}
+# repeat clustering
+split_sct = map(split_sct, ~ FindClusters(.x,
+                                          resolution = 0.5,
+                                          algorithm = "4",
+                                          method = "igraph",
+                                          random.seed = 1,
+                                          verbose = F))
+
+qsave(split_sct,"./01_QC/rds/04_split_sct.qs",nthreads = 16)
+```
+
+### 
+
+### Resources
+
+-   <https://satijalab.org/seurat/articles/integration_introduction.html#introduction-to-scrna-seq-integration>
+-   <https://cran.r-project.org/web/packages/clustree/vignettes/clustree.html>

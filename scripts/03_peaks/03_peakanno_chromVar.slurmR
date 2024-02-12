@@ -1,0 +1,134 @@
+#!/bin/bash
+#
+# ================================================= #
+# annotate peaks w hocomoco v12; run chrom var
+# ================================================= #
+#
+#SBATCH --job-name=chrvar
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kristy.ou@embl.de
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --time=99:00:00
+#SBATCH --error=.slurmR/%j_chrvar.err
+#SBATCH --output=.slurmR/%j_chrvar.out
+
+# set tmp dir with slurmR::opts_slurmR$set_tmp_path(".slurmR/")
+# from console in project, run with slurmR::sourceSlurm("scripts/03_peaks/03_peakanno_chromVar.slurmR")
+# will always have an error if first time running
+# ALWAYS WRITE TO SCRATCH! except now, because archr files have to be in final location
+
+# import library paths
+source("/home/kou/.Rprofile")
+
+library(universalmotif)
+library(TFBSTools)
+library(ArchR)
+library(BiocParallel)
+library(tidyverse)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+# always set seed!!!
+set.seed(105)
+
+addArchRThreads(threads = 64, force = T)
+addArchRGenome("hg38")
+
+# paths
+workdir = "/g/saka/Kristy/projects/composite/analysis/"
+setwd(workdir)
+
+## ANNOTATE PEAKS ## 
+
+finalPWM = qs::qread("rdata/03_02_finalPWM.qs")
+archr_all = loadArchRProject("rdata/archr/prelim_anno_peaks")
+
+# add motif anno
+h5disableFileLocking()
+archr_all = addMotifAnnotations(
+  archr_all,
+  motifPWMs = finalPWM,
+  motifSet = NULL,
+  collection = NULL,
+  annoName = "HOCOv12",
+  threads = 64,
+  force = T
+)
+h5enableFileLocking()
+
+add background peaks for chromvar
+archr_all = addBgdPeaks(archr_all, force = T)
+
+# save
+archr_all = saveArchRProject(
+  ArchRProj = archr_all,
+  outputDirectory = "rdata/archr/prelim_anno_peaks",
+  load = T
+)
+
+## CHROM VAR ##
+# separate by B and T cells
+meta = getCellColData(archr_all)
+clusters = levels(meta$prelim_anno)
+Bcells = clusters[grep("B_",clusters)]
+Tcells = clusters[grep("T_",clusters)]
+
+# subset, MUST do it with function! 
+archr_B = subsetArchRProject(
+  archr_all,
+  cells = rownames(meta)[meta$prelim_anno %in% Bcells],
+  outputDirectory = paste0(workdir,"rdata/archr/prelim_anno_B"),
+  dropCells = F, # need this, or else error with mismatched cell names!
+  force = T
+)
+
+archr_T = subsetArchRProject(
+  archr_all,
+  cells = rownames(meta)[meta$prelim_anno %in% Tcells],
+  outputDirectory =  paste0(workdir,"rdata/archr/prelim_anno_T"),
+  dropCells = F, # need this, or else error with mismatched cell names!
+  force = T
+)
+
+h5disableFileLocking()
+
+# add motif deviations to B
+archr_B = addDeviationsMatrix(
+  ArchRProj = archr_B, 
+  peakAnnotation = "HOCOv12",
+  threads = 8,
+  force = T
+)
+
+h5enableFileLocking()
+
+h5disableFileLocking()
+
+# add motif deviations to T
+archr_T = addDeviationsMatrix(
+  ArchRProj = archr_T, 
+  peakAnnotation = "HOCOv12",
+  threads = 8,
+  force = T
+)
+
+h5enableFileLocking()
+
+# save each separately
+archr_B = saveArchRProject(
+  ArchRProj = archr_B,
+  outputDirectory = paste0(workdir,"rdata/archr/prelim_anno_B"), 
+  overwrite = T,
+  load = F
+)
+
+# save each separately
+archr_T = saveArchRProject(
+  ArchRProj = archr_T,
+  outputDirectory = paste0(workdir,"rdata/archr/prelim_anno_T"), 
+  overwrite = T,
+  load = F
+)

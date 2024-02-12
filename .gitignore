@@ -1,0 +1,16 @@
+ArchRLogs/
+figures/
+rdata/
+other/
+test/
+tmp/
+.slurmR/
+.quarto/
+scratchpad/
+analysis.Rproj
+.Renviron
+.Rhistory
+.Rproj.user/
+old_scripts
+scripts/.DS_Store
+scripts/._.DS_Store

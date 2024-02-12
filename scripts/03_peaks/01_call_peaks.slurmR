@@ -1,0 +1,116 @@
+#!/bin/bash
+#
+# ================================================= #
+# call peaks with macs2
+# ================================================= #
+#
+#SBATCH --job-name=macs2
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kristy.ou@embl.de
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --time=99:00:00
+#SBATCH --error=.slurmR/%j_macs2.err
+#SBATCH --output=.slurmR/%j_macs2.out
+
+# set tmp dir with slurmR::opts_slurmR$set_tmp_path(".slurmR/")
+# from console in project, run with slurmR::sourceSlurm("scripts/03_peaks/01_call_peaks.slurmR")
+# have to run twice, (first time writes script)
+# ALWAYS WRITE TO SCRATCH! except now, because archr files have to be in final location
+
+# import library paths
+source("/home/kou/.Rprofile")
+
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ArchR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(BiocParallel)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+# always set seed!!!
+set.seed(105)
+
+addArchRThreads(threads = 32, force = T)
+addArchRGenome("hg38")
+
+# paths
+workdir = "/g/saka/Kristy/projects/composite/analysis/"
+setwd(workdir)
+
+## DATA IMPORT ##
+# import seurat data
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+wnn = qs::qread("rdata/02_04_integrated.qs")
+meta = wnn@meta.data
+
+# create combined ArchR to call peaks
+arrow = paste0("rdata/archr/",ln_id,"/ArrowFiles/",ln_id,".arrow")
+archr_all = ArchRProject(
+  ArrowFiles = arrow, 
+  outputDirectory = "rdata/archr/prelim_anno_peaks",
+  copyArrows = FALSE,
+  threads = 32
+)
+
+## SUBSET CELLS, ADD CLUSTER INFO ## 
+# need to match with integration
+archr_all = archr_all[archr_all$cellNames %in% gsub("_","#",Cells(wnn)),]
+
+# match order
+ord = match(archr_all$cellNames, gsub("_","#",rownames(meta)))
+meta = meta[ord,]
+
+# add cluster info, can't add level info
+archr_all$prelim_anno = meta$prelim_anno
+
+
+## CALL PEAKS ##
+
+h5disableFileLocking()
+archr_all = addGroupCoverages(
+  ArchRProj = archr_all, 
+  groupBy = "prelim_anno", 
+  threads = 64,
+  force = T
+)
+h5enableFileLocking()
+
+macs2path = "/g/saka/Kristy/software/envs/peakcalling/bin/macs2"
+
+archr_all = addReproduciblePeakSet(
+  ArchRProj = archr_all,
+  minCells = 50,
+  maxPeaks = 500000,
+  groupBy = "prelim_anno", 
+  pathToMacs2 = macs2path,
+  excludeChr = c("chrM","chrY"),
+  threads = 32,
+  force = T
+)
+
+archr_all = addPeakMatrix(archr_all, threads = 32, force = T)
+
+
+## WRITE BIGWIG FILES ##
+getGroupBW(
+  ArchRProj = archr_all,
+  groupBy = "prelim_anno",
+  normMethod = "ReadsInTSS",
+  tileSize = 100,
+  maxCells = 1000,
+  ceiling = 8,
+  verbose = TRUE,
+  threads = 16,
+  logFile = createLogFile("getGroupBW")
+)
+
+## SAVE ##
+archr_all = saveArchRProject(
+  ArchRProj = archr_all,
+  outputDirectory = "rdata/archr/prelim_anno_peaks", 
+  load = F
+)

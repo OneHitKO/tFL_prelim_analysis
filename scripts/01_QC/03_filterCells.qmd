@@ -1,0 +1,50 @@
+---
+title: "Filtered Cells"
+---
+
+## "Finalizing" filtered cells for downstream cells
+
+Want to subset cells that passed Seurat (RNA) and ArchR (ATAC) filtering.
+
+```{r load}
+library(Seurat)
+library(ArchR)
+library(tidyverse)
+```
+
+```{r dataImport}
+seur_flt = qs::qread("rdata/01_seur_filt.qs")
+archR_flt = loadArchRProject("rdata/archr/flt")
+
+# merge seurat, get metadata
+seur_flt = merge(
+  seur_flt[[1]], 
+  seur_flt[-1],
+  add.cell.ids = names(seur_flt)
+)
+
+# get cell names
+atac_cells = archR_flt$cellNames
+rna_cells = Cells(seur_flt)
+
+# get intersection
+keep_ids = intersect(atac_cells, gsub("_","#",rna_cells))
+
+# subset
+seur_keep = seur_flt[,rna_cells %in% gsub("#","_",keep_ids)]
+qs::qsave(seur_keep, "rdata/01_03_seur_keep.qs", nthreads=16)
+
+# TO DO: use subsetArchRProject() to drop cells in arrow files!
+archR_keep = subsetArchRProject(
+  archR_flt,
+  cells = keep_ids,
+  outputDirectory = "rdata/archr/keep",
+  force = T
+)
+
+saveArchRProject(
+  ArchRProj = archR_keep, 
+  outputDirectory = "01_QC/archRprojects/ArchRproj_keep", 
+  load = F
+)
+```

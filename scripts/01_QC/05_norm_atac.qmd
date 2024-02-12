@@ -1,0 +1,380 @@
+---
+title: "ATAC reduction"
+---
+
+```{r}
+library(Seurat)
+library(Signac)
+library(ArchR)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(parallel) # need to set threads > 1
+library(presto)
+library(tidyverse) 
+library(ggpubr)
+library(shiny)
+library(furrr)
+
+theme_set(theme_bw())
+
+set.seed(105)
+addArchRThreads(threads = 32, force = T)
+
+# future settings
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+  )
+)
+
+# this step includes ref genome, TxDb object, and blacklist!
+addArchRGenome("hg38")
+```
+
+## Creating Chromatin Assay for integration
+
+In order to perform data integration with WNN in Seurat, need to create a `Chromatin Assay` object to add to Seurat object.
+Chromatin Assay needs:
+
+1\.
+raw counts OR data (normalized counts); cannot supply both!
+features (rows) x cells (cols)
+
+2\.
+GRanges corresponding to rows
+
+3\.
+motif object \> need to check what format this is supposed to be
+
+4\.
+fragments \> either path, or a `Fragments Object` \> check to see what this looks like
+
+5\.
+genome
+
+6\.
+annotation for genome
+
+7\.
+bias for Tn5 insertion (optional??)
+
+8\.
+additional named matrices of enrichment in specific regions (ie: TSS or ChIP-seq data)
+
+```{r import data}
+# load archR proj after filtering cells from RNA and ATAC
+archR_keep = loadArchRProject("rdata/archr/keep")
+
+# separate archR by samples, better way to do this?
+archR_LN0025 = archR_keep[archR_keep$Sample == "LN0025",]
+archR_LN0027 = archR_keep[archR_keep$Sample == "LN0027",]
+archR_LN0177 = archR_keep[archR_keep$Sample == "LN0177",]
+archR_LN0193 = archR_keep[archR_keep$Sample == "LN0193",]
+archR_LN0438 = archR_keep[archR_keep$Sample == "LN0438",]
+
+# create list of projects to process individually
+archR_all = c(archR_LN0025,archR_LN0027,archR_LN0177,archR_LN0193,archR_LN0438)
+
+# create list of outputDirectory to save ArchR projects
+outDir = paste0("rdata/archr/",c("LN0025","LN0027","LN0177","LN0193","LN0438"))
+
+# save all projects
+map2(
+  archR_all, 
+  outDir, 
+  ~ saveArchRProject(
+    ArchRProj = .x, 
+    outputDirectory = .y, 
+    load = F
+  )
+)
+
+# test loading projects
+archR_all = lapply(outDir,loadArchRProject)
+
+# clear env
+rm(archR_LN0025,archR_LN0027, archR_LN0177,archR_LN0193,archR_LN0438)
+```
+
+### LSI reduction
+
+Perform LSI clustering using 500bp genomic tiles (not peaks like in Signac).
+Test how different number of iterations affect clustering!
+Add "LSI_2" vs "LSI_4" Will increase resolution for each iteration (should be iterations - 1).
+The resolution here is NOT for assigning cluster identity, it is to help identify "average accessibility" for each cluster for linear reduction.
+
+TO DO: Add additional LSI!!!
+LSI_6 for sure
+
+```{r lsi, include=T}
+# can also have multiple resolutions for clustering, use the same number as in gex norm
+# clusterParams are same as in Seurat
+# test 2 vs 4 iterations to see if noticeable difference
+archR_all = map(
+  archR_all, 
+  ~ addIterativeLSI(
+    .x,
+    useMatrix = "TileMatrix",
+    name = "LSI_2", 
+    iterations = 2,
+    clusterParams = list(
+      resolution = 0.75, # matched res of scRNA
+      sampleCells = 10000,
+      n.start = 10
+    ), 
+    varFeatures = 25000, 
+    dimsToUse = 1:30
+  )
+)
+
+archR_all = map(
+  archR_all, 
+  ~ addIterativeLSI(
+    .x,
+    useMatrix = "TileMatrix",
+    name = "LSI_4", 
+    iterations = 4, 
+    clusterParams = list(
+      resolution = 0.75,
+      sampleCells = 10000,
+      n.start = 10
+    ), 
+    varFeatures = 25000,
+    dimsToUse = 1:30
+  )
+)
+
+# save projects
+map2(
+  archR_all, 
+  outDir, 
+  ~ saveArchRProject(ArchRProj = .x, outputDirectory = .y, load = F)
+)
+
+# load projects
+archR_all = lapply(outDir,loadArchRProject)
+```
+
+### Clustering
+
+Perform clustering on both LSI_2 and LSI_4 dimensional reductions, compare output.
+Start with resolution 0.75.
+TO DO: need to nest map2 within lapply to test different resolutions TO DO: try with leiden clustering
+
+```{r clustering, include=T}
+## clustering on LSI_2 first
+archR_all = map(
+  archR_all, 
+  ~ addClusters(
+    .x,
+    reducedDims = "LSI_2",
+    method = "Seurat",
+    name = "LSI2res0.75",
+    resolution = 0.75,
+    dimsToUse = 1:30
+  )
+)
+
+## clustering on LSI_4
+archR_all = map(
+  archR_all, 
+  ~ addClusters(
+    .x,
+    reducedDims = "LSI_4",
+    method = "Seurat",
+    name = "LSI4res0.75",
+    resolution = 0.75,
+    dimsToUse = 1:30,
+    force = T
+  )
+)
+
+# save projects
+map2(
+  archR_all, 
+  outDir, 
+  ~ saveArchRProject(ArchRProj = .x, outputDirectory = .y, load = F)
+)
+
+archR_all = lapply(outDir,loadArchRProject)
+```
+
+### UMAP embeddings
+
+Add umap based on LSI2 vs LSI4, compare
+
+```{r umap}
+archR_all = map(
+  archR_all, 
+  ~ addUMAP(
+    .x,
+    reducedDims = "LSI_2",
+    name = "lsi2.atacUMAP",
+    seed = 105,
+    outlierQuantile = 0.99,
+    force = T
+  )
+)
+
+archR_all = map(
+  archR_all, 
+  ~ addUMAP(
+    .x,
+    reducedDims = "LSI_4",
+    name = "lsi4.atacUMAP",
+    seed = 105,
+    outlierQuantile = 0.99,
+    force = T
+  )
+)
+
+# save projects
+map2(
+  archR_all, 
+  outDir, 
+  ~ saveArchRProject(ArchRProj = .x, outputDirectory = .y, load = F)
+)
+
+archR_all = lapply(outDir,loadArchRProject)
+
+# quick plot
+lsi4.umap = lapply(
+  archR_all, 
+  plotEmbedding, 
+  colorBy = "cellColData", 
+  name = "LSI4res0.75", 
+  embedding = "lsi4.atacUMAP"
+)
+
+lsiumppl = cowplot::plot_grid(plotlist = lsi4.umap)
+ggsave("figures/01_05_lsi4.atacUMAP.png", lsiumppl, width = 8.5, height = 8)
+
+# lsi2.atacUMAP, compare with same clusters as lsi4.atacumap
+lsi2.umap = lapply(
+  archR_all, 
+  plotEmbedding, 
+  colorBy = "cellColData", 
+  name = "LSI4res0.75", 
+  embedding = "lsi2.atacUMAP"
+)
+
+lsiumppl2 = cowplot::plot_grid(plotlist = lsi2.umap)
+ggsave("figures/01_05_lsi2.atacUMAP.png", lsiumppl2,width = 8.5, height = 8)
+```
+
+### Get imputed weights to be used for gene score activity matrix
+
+Use LSI 4 dimen reduction
+
+```{r impute weights, include = T}
+archR_all = lapply(
+  archR_all, 
+  addImputeWeights,
+  reducedDims = "LSI_4",
+  dimsToUse=1:30,
+  sampleCells=10000
+)
+
+# save
+map2(
+  archR_all, 
+  outDir, 
+  ~ saveArchRProject(ArchRProj = .x, outputDirectory = .y, load = F)
+)
+
+archR_all = lapply(outDir,loadArchRProject)
+```
+
+### Plot features in UMAP embedding
+
+Want to get a sense how heterogeneous the B and T cell populations are.
+
+```{r}
+# get unimputed matrix, which is contained in the summarized experiment object
+# gene names are accessed in elementMetadata and are all the same!
+# TO DO: can remove genes that are 0 for all cells
+geneScoreMat = lapply(
+  archR_all, 
+  getMatrixFromProject, 
+  useMatrix = "GeneScoreMatrix", 
+  verbose=F
+)
+
+geneNames = geneScoreMat[[1]]@elementMetadata$name
+
+# get impute weights
+imputeWeights = lapply(archR_all, getImputeWeights)
+
+# get matrix w impute scores, 
+# need to use se object in geneScoreMat to get gene names (rows)
+imputedMat = future_map2(
+  geneScoreMat,
+  imputeWeights, 
+  ~ imputeMatrix(assay(.x),.y)
+)
+
+# reformat: add gene names, transpose
+imputedMat = lapply(imputedMat, function(x){
+  rownames(x) = geneNames
+  x = t(x)
+  return(x)
+  }
+)
+
+# remove columns with colsum = 0 (not expressed in any cell)
+# to do future lapply
+imputedMat = lapply(imputedMat, function(x){
+  # get which cols have colsum != 0 (gene expressed in some cells)
+  whichToKeep = colSums(x) != 0
+  
+  # subset mat w/ cols to keep
+  sub = x[,whichToKeep]
+  
+  # round for readability
+  sub = round(sub, digits = 4)
+  return(sub)
+  }
+)
+
+# OPTIONAL?! 
+# get umap embedding
+umapEmbed = lapply(archR_all, getEmbedding, embedding = "lsi4.atacUMAP")
+
+# rename umap embedding columns, add sample name 
+umapEmbed = map(
+  umapEmbed, 
+  ~ as_tibble(.x, rownames = "cellID") %>%
+    rename("atacUMAP_1" = 2, "atacUMAP_2" = 3) %>%
+    mutate(Sample = str_replace(cellID,"#.*",""))
+)
+
+# add clustering info from colData of ArchR project
+umapEmbed = map2(
+  umapEmbed, 
+  archR_all, 
+  ~ .x %>%
+    mutate(cluster = .y$LSI4res0.75)
+)
+
+# cbind imputed matrix w/ genes, checked that rownames of imputedMat == umapEmbed$cellID
+# map2(imputedMat, umapEmbed, ~all(rownames(.x)==.y$cellID))
+umapEmbed = map2(umapEmbed, imputedMat, ~ cbind(.x,.y))
+
+# save rds
+qs::qsave(umapEmbed,"rdata/01_05_atacumapembed.qs", nthreads=16)
+```
+
+**Plot gene score activity features**
+
+```{r}
+var = "PAX5"
+
+ftplls = lapply(umapEmbed, function(x){
+  ggplot(x, aes(atacUMAP_1,atacUMAP_2))+
+  geom_jitter(size = 0.25, aes(color = .data[[var]])) +
+  scale_color_viridis_c(option = "plasma") +
+  theme(aspect.ratio = 3/3,panel.grid = element_blank())
+  }
+)
+
+cowplot::plot_grid(plotlist = ftplls)
+```

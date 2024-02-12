@@ -1,0 +1,75 @@
+---
+title: "convert to anndata"
+---
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+library(SeuratObject)
+#library(MuDataSeurat)
+library(reticulate)
+
+#use_condaenv("cell2location", required = T)
+
+# check
+#py_config()
+```
+
+```{r}
+integrated = qs::qread("rdata/02_04_integrated.qs")
+
+DefaultAssay(integrated) = "RNA"
+
+# diet, cannot remove scaled.data through layers argument! bug! 
+diet = DietSeurat(
+  integrated,
+  features = rownames(integrated),
+  assays = "RNA",
+  dimreducs = c("rpca.rnaPCA.wnnUMAP"),
+  graphs = c("rpca.rnaPCA.wsnn","rpca.rnaPCA.wknn")
+)
+
+# create RNA v3 assay, MANDATORY for writing to h5ad
+diet[["RNA"]] = as(object = diet[["RNA"]], Class = "Assay")
+
+# drop scaled data here!!! NEED TO DROP SCALED DATA or else counts will not be preserved
+diet[["RNA"]]$scale.data <- NULL
+
+
+# convert table into characters otherwise only preserves levels!
+meta = diet@meta.data
+
+meta = data.frame(lapply(meta, as.character), stringsAsFactors=FALSE)
+
+diet@meta.data = meta
+```
+
+-   
+
+    -   `X` will be filled with `scale.data` if `scale.data` is present; otherwise, it will be filled with `data`
+
+    -   `var` will be filled with `meta.features` **only** for the features present in `X`; for example, if `X` is filled with `scale.data`, then `var` will contain only features that have been scaled
+
+    -   `raw.X` will be filled with `data` if `X` is filled with `scale.data`; otherwise, it will be filled with `counts`.
+        If `counts` is not present, then `raw` will not be filled
+
+    -   `raw.var` will be filled with `meta.features` with the features present in `raw.X`; if `raw.X` is not filled, then `raw.var` will not be filled
+
+-   <https://mojaveazure.github.io/seurat-disk/reference/Convert.html>
+
+-   TO DO: can you save multiple slots or is it mu data type only?
+
+```{r}
+SaveH5Seurat(
+  diet,
+  filename = "/scratch/kou/composite/rdata/forVal_all_RNA.h5Seurat",
+  overwrite = T
+)
+
+Convert(
+  source = "/scratch/kou/composite/rdata/forVal_all_RNA.h5Seurat",
+  dest = "h5ad",
+  overwrite = T, 
+  assay = "RNA"
+)
+```

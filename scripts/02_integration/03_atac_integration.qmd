@@ -1,0 +1,196 @@
+---
+title: "ATAC Integration"
+---
+
+**Libraries**
+
+```{r}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(shiny)
+#library(reticulate)
+#library(clustree)
+
+# always set seed!!! need to repeat
+set.seed(105)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# set python
+#use_virtualenv("~/composite/analysis/old_scripts/sc_py_env")
+```
+
+**Data Import**
+
+```{r}
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+atac_list = qs::qread("rdata/02_02_atac_seurat.qs")
+
+names(atac_list) = ln_id
+```
+
+## Integrate and batch correct ATAC modalities
+
+Samples are integrated through their low-dimensional cell embeddings instead of their count matrix of binned genome (reciprocal LSI).
+Because the binned genome is the same for all samples, the features will be the same.
+
+More info: <https://stuartlab.org/signac/articles/integrate_atac.html>
+
+### Preprocessing
+
+In previous steps, only kept features that were present in 1% of cells in each sample.
+Can filter for additional features if needed.
+
+Notes on sparse matrix slots:<https://statisticaloddsandends.wordpress.com/2020/03/31/what-is-a-dgcmatrix-object-made-of-sparse-matrix-format-in-r/>
+
+**Example of filtering for features in \>50 cells**
+
+```{r, include = F, eval = F}
+# get count matrices
+# confirmed that binned ranges are in same order in each file
+count_list = lapply(atac_list, function(x) x@assays$ATAC@counts)
+names(count_list) = ln_id
+
+# get row indices of count table were 
+keepFrags = lapply(count_list, function(sparseM){
+  
+  # binarize the matrix; if there's a value, assign 1
+  sparseM@x[] = T
+  
+  # find which fragments (rows) had insertion events >= 50 cells
+  keepFrags = rownames(sparseM)[rowSums(sparseM) >= 50]
+  
+  return(keepFrags)
+})
+```
+
+**Get union of features - TO delete??**
+
+```{r}
+# get features from rownames of assay
+frags = lapply(atac_list, function(x) rownames(x[["ATAC"]]))
+names(frags) = ln_id
+
+# get the union of row indices to subset chromatinAssay
+allfrags = do.call(c,frags) %>% unique(.)
+```
+
+### Create shared low dimesional space "recprocal LSI"
+
+Because the data is sparse, the samples are integrated through a shared low-dimensional space by "reciprocal LSI" by projecting each dataset into the next dataset's LSI space.
+Therefore, *need to create a shared LSI space by merging all data sets first.*
+
+More info on integration in Seurat: <https://www.sciencedirect.com/science/article/pii/S0092867419305598?via%3Dihubs>
+
+More info on methods to calculate LSI: <http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/>
+
+```{r}
+# merge data sets
+merged = merge(atac_list[[1]],atac_list[-1])
+
+# process combined dataset
+merged = FindTopFeatures(merged, min.cutoff = 50) %>%
+  RunTFIDF(., method = 3) %>%
+  RunSVD(.)
+
+# check whether components correlate with seq depth
+DepthCor(merged)
+
+# UMAP of merged data before embedding
+merged = RunUMAP(
+  merged, 
+  reduction = "lsi", 
+  dims = 2:30,
+  reduction.name = "atacUMAP",
+  reduction.key = "atacUMAP_"
+)
+
+beforeInt = DimPlot(
+  merged,
+  group.by = "Sample", 
+  pt.size = 0.01
+) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("figures/02/03_merged_atacUMAP.png", width = 5, height = 5)
+```
+
+### Find integration anchors
+
+Use *all* features to find anchors.
+
+```{r}
+# calculate lsi in new_atac
+atac_list = map(
+  atac_list, 
+  ~ FindTopFeatures(
+    .x, min.cutoff = 50) %>%
+    RunTFIDF(., method = 3) %>%
+    RunSVD(.)
+)
+
+# find integration anchors, remove 1st PC
+anchorsATAC = FindIntegrationAnchors(
+  object.list = atac_list,
+  anchor.features = allfrags,
+  reduction = "rlsi",
+  dims = 2:30
+)
+
+# integrate lsi embeddings
+atac_integrated = IntegrateEmbeddings(
+  anchorset = anchorsATAC,
+  reductions = merged[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate = 1:30
+)
+```
+
+### Dimensional reduction on integrated ATAC
+
+```{r}
+# check which component correlates w sequencing depth
+DepthCor(atac_integrated, reduction = "integrated_lsi")
+
+# # find neighbors
+# atac_integrated = FindNeighbors(
+#   atac_integrated,
+#   reduction = "integrated_lsi",
+#   dims = 2:30,
+#   verbose = FALSE
+# )
+
+# create umap embedding
+atac_integrated = RunUMAP(
+  atac_integrated, 
+  reduction = "integrated_lsi", 
+  dims=2:30, 
+  reduction.name = "atacUMAP", 
+  reduction.key = "atacUMAP_"
+)
+
+# plot
+afterInt = DimPlot(
+  atac_integrated,
+  group.by = "Sample", 
+  pt.size = 0.01,
+  alpha = 0.5
+) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("figures/02/03_integrated_atacUMAP.png", afterInt,width = 5, height = 5)
+
+
+#features 
+featplot = FeaturePlot(
+  atac_integrated,
+  pt.size = 0.01,
+  features = c("MS4A1","CD3D")
+)
+ggsave("figures/02/03_integrated_BvsT.png",featplot, width = 8, height = 4)
+
+# save FINAL
+qs::qsave(atac_integrated, "rdata/02_02_atac_integrated.qs", nthreads = 32)
+```

@@ -1,0 +1,225 @@
+#!/bin/bash
+#
+# ================================================= #
+# run numbat benchmark
+# ================================================= #
+#
+#SBATCH --job-name=runnumbat
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kristy.ou@embl.de
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=99:00:00
+#SBATCH --error=.slurmR/%j_runNumbat.err
+#SBATCH --output=.slurmR/%j_runNumbat.out
+
+# set tmp dir with slurmR::opts_slurmR$set_tmp_path(".slurmR/")
+# from console in project, run with slurmR::sourceSlurm("scripts/04_mutation/02_run.numbat.slurmR")
+# have to run twice, (first time writes script)
+# ALWAYS WRITE TO SCRATCH!
+
+# import library paths
+source("/home/kou/.Rprofile")
+
+library(Seurat)
+library(Signac)
+library(tidyverse, quietly = T)
+library(numbat)
+library(future)
+library(furrr)
+
+set.seed(105)
+sessionInfo()
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+))
+
+setwd("/g/saka/Kristy/projects/composite/analysis")
+
+# import data
+LN_ID = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+wnn = qs::qread("rdata/02_04_integrated.qs", nthreads = 32)
+meta = as_tibble(wnn@meta.data, rownames = "cell_id")
+
+DefaultAssay(wnn) = "RNA"
+
+# ==== BENCHMARK 1 ====
+# notes:
+# * benchmark 1 originally ran in different script without future, w ncores = 1
+# * snippet moved here to keep all together
+
+# get allele counts, was determined in all cells ----
+dir="/scratch/kou/composite/numbat/"
+files = list.files(paste0(dir,LN_ID), pattern = "tsv.gz$", full.names = T)
+alleleCounts = lapply(files, read_tsv)
+
+## modify cell id to match seurat, filter for "keep" cells
+alleleCounts = map2(
+  LN_ID,
+  alleleCounts,
+  ~ .y %>%
+    mutate(cell = paste0(.x,"_",cell))
+)
+
+# get count matrix ----
+## count matrix, split by sample
+countMat = LayerData(wnn, "counts")
+
+## split count matrix by sample
+splitcounts = lapply(seq_along(LN_ID), function(x){
+  mat = countMat[,grepl(LN_ID[[x]],colnames(countMat))]
+
+  # round mat to integer, otherwise error later
+  mat = round(mat)
+  return(mat)
+})
+
+# make collective reference matrix ----
+## remove B_sub3+ (likely patient specific tumor cells; BCL2 high and individual clustering)
+tumorB = paste0("B_sub",3:10)
+
+## get counts, subset cells
+refCounts = countMat[, !(Idents(wnn) %in% tumorB)]
+
+## create anno
+refAnno = meta %>%
+  filter(cell_id %in% colnames(refCounts)) %>%
+  select(cell = cell_id, group = prelim_anno)
+
+## aggregate counts
+ref_internal = aggregate_counts(refCounts, refAnno, normalized = T, verbose = F)
+
+
+# run numbat ----
+## should run on slurm next time
+outdir="/scratch/kou/composite/rdata/numbat/benchmark1/"
+rm(wnn)
+gc()
+
+# to do
+# need to troubleshoot why warning stops future_map()
+# map() is fine though
+nbResults = future_map(
+  seq_along(LN_ID),
+  ~ run_numbat(
+    count_mat = splitcounts[[.x]],
+    lambdas_ref = ref_internal,
+    df_allele = alleleCounts[[.x]],
+    genome = "hg38",
+    out_dir = paste0(outdir,LN_ID[[.x]]),
+    t = 1e-06,
+    gamma = 20,
+    min_cells = 30,
+    min_depth = 0,
+    multi_allelic = T,
+    tau = 0.25,
+    ncores = 8,
+    ncores_nni = 8
+  ),
+  .options = furrr_options(
+    seed = T,
+    scheduling = Inf
+  )
+)
+
+rm(nbResults)
+gc()
+
+# ==== BENCHMARK 2 ====
+# ---- get allele counts, was determined in all cells ----
+#wnn = qs::qread("rdata/02_04_integrated.qs", nthreads = 32)
+
+# dir="/scratch/kou/composite/numbat/"
+# files = list.files(paste0(dir,LN_ID), pattern = "tsv.gz$", full.names = T)
+# alleleCounts2 = lapply(files, read_tsv)
+#
+# ## modify cell id to match seurat
+# alleleCounts2 = map2(
+#   LN_ID,
+#   alleleCounts2,
+#   ~ .y %>%
+#     mutate(cell = paste0(.x,"_",cell))
+# )
+
+# # ---- get count matrix ----
+# ## count matrix, split by sample
+# countMat2 = wnn[["RNA"]]@counts
+# 
+# ## split count matrix by sample
+# countMat2 = lapply(1:4, function(x){
+#   mat = countMat2[,grepl(LN_ID[[x]],colnames(countMat2))]
+# 
+#   # round mat to integer, otherwise error later
+#   mat = round(mat)
+#   return(mat)
+# })
+
+# # ---- make patient specific reference matrix ----
+# ## remove bcl2.hi and mitotic bc (likely) tumor cells
+# noBCL2hi = levels(wnn)[!grepl("BCL2.hi|mitotic",levels(wnn))]
+# 
+# ## get counts, subset cells
+# refCounts2 = wnn[["RNA"]]@counts[, Idents(wnn) %in% noBCL2hi]
+# 
+
+## split ref matrix by sample
+refCounts2 = lapply(seq_along(LN_ID), function(x){
+  mat = refCounts[,grepl(LN_ID[[x]],colnames(refCounts))]
+  return(mat)
+})
+
+## create anno
+refAnno2 = meta %>%
+  filter(cell_id %in% colnames(refCounts)) %>%
+  group_split(Sample, .keep = F) %>%
+  select(cell = cell_id, group = prelim_anno) %>%
+  
+
+## aggregate counts
+ref2 = map2(
+  refCounts2,
+  refAnno2,
+  ~ aggregate_counts(
+    .x,
+    .y,
+    normalized = T,
+    verbose = F
+  )
+)
+
+# ---- run numbat ----
+gc()
+
+outdir="/scratch/kou/composite/rdata/numbat/benchmark2/"
+
+# change to future_map
+nbResults2 = future_map(
+    seq_along(LN_ID),
+    ~ run_numbat(
+      count_mat = splitcounts[[.x]],
+      lambdas_ref = ref2[[.x]],
+      df_allele = alleleCounts[[.x]],
+      genome = "hg38",
+      out_dir = paste0(outdir,LN_ID[[.x]]),
+      t = 1e-06,
+      gamma = 20,
+      min_cells = 30,
+      min_depth = 0,
+      multi_allelic = T,
+      tau = 0.25,
+      ncores = 8,
+      ncores_nni = 8
+      ),
+      .options = furrr_options(
+        seed = T,
+        scheduling = Inf
+  )
+)
+
+# move directory
+scratch = "/scratch/kou/composite/rdata/numbat"
+R.utils::copyDirectory(scratch, "rdata/numbat")
+

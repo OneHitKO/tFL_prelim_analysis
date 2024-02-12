@@ -1,0 +1,478 @@
+---
+title: "QC of composite lymphoma 10X multiome data: GEX"
+---
+
+**Packages**
+
+```{r}
+#| label: setup
+
+library(Seurat)
+library(tidyverse, quietly = T)
+library(reticulate)
+library(scDblFinder)
+library(SoupX)
+library(DropletUtils)
+library(furrr)
+library(future.apply)
+library(scCustomize)
+library(ggridges)
+
+theme_set(theme_bw())
+
+# always set seed!!!
+set.seed(105)
+
+# future settings
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+  )
+)
+```
+
+## GEX data import
+
+-   Individual modalities are preprocessed separately prior to integration.
+-   Import both raw and filtered features to perform SoupX.
+-   TO DO: use cellbender to skip SoupX and proceed to
+
+```{r}
+#| label: data_import
+
+# list of samples
+ln_id = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+
+# import droplets (raw) ----
+droplets = paste0(
+  "~/composite/cellranger/",
+  ln_id,
+  "/outs/raw_feature_bc_matrix/"
+)
+
+list_drop = future_lapply(droplets,Read10X)
+names(list_drop) = ln_id
+
+# keep only GEX
+list_drop = future_map(list_drop, ~ .x$`Gene Expression`)
+
+# import filtered count ----
+nondrops = paste0(
+  "~/composite/cellranger/",
+  ln_id,
+  "/outs/filtered_feature_bc_matrix/"
+)
+
+list_nondrop = future_lapply(nondrops,Read10X)
+names(list_nondrop) = ln_id
+
+# keep only GEX
+list_nondrop = future_map(list_nondrop, ~ .x$`Gene Expression`)
+```
+
+## Droplet processing
+
+-   Want to determine which barcodes are cells vs empty droplets
+-   Want to remove ambient mRNA from empty droplets later
+
+### Knee plot
+
+```{r}
+#| label: barcode_ranking
+bcranks = future_lapply(list_drop, barcodeRanks)
+
+# write function to plot
+plot_knee = function(bc_out){
+
+  # get knee/inflection data
+  knee = metadata(bc_out)$knee
+  infl = metadata(bc_out)$inflection
+  
+  p = as_tibble(bc_out) %>% 
+    ggplot(., aes(rank,total))+
+    geom_jitter(size = 0.5) +
+    geom_hline(yintercept = c(knee,infl), color = c("blue","forestgreen")) +
+    scale_x_continuous(trans = "log10") +
+    scale_y_continuous(trans = "log10") +
+    labs(x = "Barcode Rank", y = "UMI Counts")
+  
+  return(p)
+}
+
+knees = future_map(
+  seq_along(bcranks),
+  ~ plot_knee(bcranks[[.x]])
+)
+
+knplt = cowplot::plot_grid(plotlist = knees, labels = ln_id)
+ggsave("figures/01_01_knee.png", knplt, width = 12, height = 8)
+```
+
+## SoupX removal of ambient RNA
+
+### Creating `SoupChannel` objects
+
+-   input required: table of droplets and table of counts
+-   also need to add clustering and dimensionality reduction embeddings to metadata
+-   can use `cellranger` preliminary analysis outputs
+
+```{r}
+#| label: createSoupChannelObject
+list_soup = future_map2(
+  list_drop, 
+  list_nondrop, 
+  ~ SoupChannel(.x,.y),
+  .options = furrr_options(scheduling = Inf)
+)
+
+# get clustering data, use cell ranger output
+clusterPath = paste0(
+  "~/composite/cellranger/",
+  ln_id,
+  "/outs/analysis/clustering/gex/graphclust"
+)
+
+clusterFiles = list.files(
+  path=clusterPath, 
+  pattern="clusters.csv", 
+  full.names=T
+)
+
+list_clusters = lapply(clusterFiles, read_csv)
+names(list_clusters) = ln_id
+
+# add clusters to soup channel
+# checked all(rownames(list_soup$LN0025$metaData) == list_clusters$LN0025$Barcode)
+list_soup = future_map2(
+  list_soup, 
+  list_clusters, 
+  ~ setClusters(.x,.y$Cluster),
+  .options = furrr_options(scheduling = Inf)
+)
+
+# get umap embeddings
+umapPath = paste0(
+  "~/composite/cellranger/",
+  ln_id,
+  "/outs/analysis/dimensionality_reduction/gex"
+)
+
+umapFiles = list.files(path = umapPath, pattern="umap_projection.csv", full.names=T)
+
+list_umap = lapply(umapFiles, read_csv)
+names(list_umap) = ln_id
+
+# add umap embeddings to soup channel
+list_soup = map2(
+  list_soup, 
+  list_umap, 
+  ~ setDR(.x,.y[c("UMAP-1","UMAP-2")],"UMAP")
+)
+```
+
+### Visualization of contamination
+
+Before soup contamination removal: check expression of cell-specific markers (count \> 1)
+
+```{r ms4a1_beforeCorrection}
+# create function
+featureUMAP = function(soupchannelobj,gene){
+  ggplot(soupchannelobj$metaData, aes(UMAP_1,UMAP_2))+
+    geom_jitter(
+      aes(color = soupchannelobj$toc[gene,]>1), 
+      size=0.1,
+      alpha = 0.5
+    )+
+    theme(aspect.ratio = 3/3,
+          panel.grid = element_blank())+
+    labs(color = toString(gene))
+}
+
+cowplot::plot_grid(plotlist = lapply(list_soup,featureUMAP, gene = "TRAC"))
+```
+
+Plot to see if expression is more than expected in soup.
+In the "CD247" (CD3 zeta) example, can see that the B cell clusters do not overcome threshold above soup!
+
+```{r markermap}
+cowplot::plot_grid(plotlist = lapply(list_soup, plotMarkerMap, geneSet = "CD247", pointSize = 1))
+```
+
+### Estimating contaminating fraction (automated)
+
+Can do this manually by specifying a set of "non expressed genes" that should NOT be expressed in some cell types/clusters, or can do it automatically.
+
+"The key thing to understand is that the contamination fraction estimate is the fraction of your data that will be discarded. If this value is set too low, your"corrected" data will potentially still be highly contaminated. If you set it too high, you will discard real data, although there are good reasons to want to do this at times (see section below). If the contamination fraction is in the right ball park, SoupX will remove most of the contamination. It will generally not matter if this number if off by a few percent."
+
+For now, do automated estimation.
+
+Contamination fraction set to 15% to remove \>98% of the contamination.
+
+```{r automatedEstimation}
+# set contamination fraction
+list_soup = lapply(list_soup, setContaminationFraction, contFrac=0.15)
+
+# automated contamination estimation
+list_soup = lapply(list_soup, autoEstCont)
+```
+
+### Correcting expression profile
+
+Method = subtraction
+
+```{r correction}
+out = lapply(list_soup, adjustCounts, roundToInt = TRUE)
+#qsave(out,"rdata/00_out.qs", nthreads = 16)
+
+# create seurat
+seur_unfilt = map2(out, names(out), ~ CreateSeuratObject(.x, project = .y))
+```
+
+### QC metrics
+
+-   UMI count (nCount_RNA)
+-   Gene features count (nFeature_RNA)
+-   Number of genes detected per UMI for complexity, see novelty score (log10GenesperUMI)
+-   Perc. of mitochondrial reads (ratio_mt)
+-   to do: calc number of reads w/ TSO, need to look into fastq files
+
+```{r add to metadata}
+# calc ratio of UMI/gene
+calc_noveltyScore = function(seuObj){
+  seuObj$log10Genes_per_UMI = log10(seuObj$nFeature_RNA) / log10(seuObj$nCount_RNA)
+  return(seuObj)
+}
+
+# calc ratio of MT genes
+calc_mt = function(seuObj){
+  seuObj$ratio_mt = PercentageFeatureSet(seuObj, pattern = "^MT-")/100
+  return(seuObj)
+} 
+
+seur_unfilt = lapply(seur_unfilt, calc_noveltyScore)
+seur_unfilt = lapply(seur_unfilt, calc_mt)
+```
+
+Basic visualization with box plots.
+
+```{r plot all test2, include=T, warning=F}
+# get list of metadata
+## TO DO: troubleshoot this??
+metadata = map2(
+  seur_unfilt, 
+  names(seur_unfilt),
+  ~.x@meta.data %>%
+    rownames_to_column(var = "cell_ID") %>%
+    mutate(LN_ID = .y)
+) 
+
+metadata = do.call(rbind,metadata)
+
+# also pivot for plotting purposes, possibly unneccessary!
+metadata_piv = pivot_longer(
+  metadata, 
+  cols = c("nCount_RNA","nFeature_RNA","log10Genes_per_UMI","ratio_mt"),
+  names_to = "metric",
+  values_to = "value"
+)
+
+# boxplot, all
+ggplot(metadata_piv, aes(LN_ID,value)) +
+  geom_boxplot(aes(fill = LN_ID),
+               alpha = 0.5,
+               outlier.shape = NA) +
+  theme(aspect.ratio = 4/3,
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  scale_y_log10(n.breaks = 8) +
+  facet_grid(rows = vars(metric), scales = "free") + 
+  labs(x = NULL, y = "Value")
+
+ggsave("figures/01_01_gexQCunflt.png")
+```
+
+Individual density plots + cut offs TO DO: PLOT with IQR cutoffs!
+
+```{r plots w cutoffs, include=T}
+# plotting function
+plot_ridges = function(metadata.df, metric){
+  p_out = ggplot(metadata.df,aes(.data[[metric]],fct_rev(LN_ID))) +
+    geom_density_ridges(aes(fill = LN_ID), alpha = 0.5) +
+    theme(aspect.ratio = 3/3,
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          panel.grid = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5)) +
+    scale_x_log10() +
+    labs(title = metric)
+  
+  return(p_out)
+}
+
+# nCount_RNA (UMIs)
+p1 = plot_ridges(metadata,"nCount_RNA")+
+  geom_vline(xintercept = c(500,40000), alpha = 0.5) +
+  labs(subtitle = "[500,40000]")
+
+# nFeature_RNA (Unique Genes)
+p2 = plot_ridges(metadata,"nFeature_RNA")+
+  geom_vline(xintercept = c(300,7000), alpha = 0.5) +
+  labs(subtitle = "[300,7000]")
+
+# complexity
+p3 = plot_ridges(metadata,"log10Genes_per_UMI")+
+  geom_vline(xintercept = 0.85, alpha = 0.5) +
+  labs(subtitle = "[0.85,1.0]")
+
+# mt reads
+p4 = plot_ridges(metadata,"ratio_mt")+
+  geom_vline(xintercept = 0.15, alpha = 0.5) +
+  scale_x_continuous() +
+  xlim(c(0,0.3)) +
+  labs(subtitle = "[0,0.15]")
+
+# TO DO: remove more white space, save plot
+ggpubr::ggarrange(
+  p1,p2,p3,p4,
+  nrow=2,ncol=2,
+  common.legend = T, 
+  legend = "right"
+)
+
+ggsave("figures/01_01_gexQC_density.png")
+```
+
+### Determining outliers by IQR
+
+Use `nCount_RNA and nFeature_RNA < Q1-1.5IQR or > Q3 + 1.5IQR` to mark outlier cells.
+
+```{r IQR calc, include=T}
+get_q1 = function(x) quantile(x)[["25%"]]
+get_q3 = function(x) quantile(x)[["75%"]]
+
+# function to get which cells are outliers
+find_outliers = function(seurObj){
+  # get nCount_RNA and nFeatures_RNA
+  nUMI = seurObj$nCount_RNA
+  nGene = seurObj$nFeature_RNA
+  
+  # get names of cells which are outliers 
+  nUMI_out = which(
+    nUMI < (get_q1(nUMI) - 1.5*IQR(nUMI)) | nUMI > (get_q3(nUMI) + 1.5 * IQR(nUMI))
+  )
+  
+  nGene_out = which(
+    nGene < (get_q1(nGene) - 1.5*IQR(nGene)) | nGene > (get_q3(nGene) + 1.5 * IQR(nGene))
+  )
+  
+  discardCells = union(names(nUMI_out),names(nGene_out))
+  return(discardCells)
+}
+
+# get names of cells to DISCARD
+toDISCARD = lapply(seur_unfilt,find_outliers)
+```
+
+### Filtering cells on MERGED dataset
+
+Used the following filtering parameters:
+
+\* cells are not outliers
+
+\* cells meet minimum threshhold for UMI and Feature count:
+
+\* 500 \<= nCount_RNA
+
+\* 300 \<= nFeature_RNA
+
+\* complexity score \>= 0.85
+
+\* ratio_mt \<= 0.15
+
+```{r initial filtering, include=T}
+# create cell ids column
+# seur_unfilt = lapply(seur_unfilt, function(x){
+#   x$cell_ids = colnames(x)
+#   return(x)
+# })
+
+# need function for map2 to work within subset function
+'%ni%' <- function(x,y)!('%in%'(x,y))
+
+# subset cells
+seur_filt = map2(
+  seur_unfilt, 
+  toDISCARD, 
+  ~ subset(
+    .x,
+    subset = (nCount_RNA >= 500) &
+      (nCount_RNA <= 50000) &
+      (Cells(.x) %ni% .y) &
+      (log10Genes_per_UMI >= 0.85) &
+      (ratio_mt <= 0.15)
+  )
+)
+```
+
+### Remove doublets with scDblFinder
+
+-   Needed to remove low quality cells first (ie: low read counts / features)
+-   Assumes rate of doublets predicted by 10X ("By default this is assumed to be 1% per thousand cells captured (so 4% among 4000 thousand cells), which is appropriate for 10x datasets. Corrections for homeotypic doublets will be performed on the given rate.")
+
+```{r scDblFinder}
+# convert to SingleCellExperiment class
+seur_sce = lapply(seur_filt, as.SingleCellExperiment)
+
+# find doublets without clustering
+seur_sce = map(seur_sce, ~ scDblFinder(.x, clusters = F))
+
+# filter cells based on predicted singlet or doublet
+# check that all(colnames(seur_sce[[1]]) == colnames(seur_filt[[1]]))
+seur_filt = lapply(seq_along(seur_filt), function(x){
+  filt2 = seur_filt[[x]][,seur_sce[[x]]$scDblFinder.class == "singlet"]
+  return(filt2)
+})
+
+names(seur_filt) = ln_id
+```
+
+Number of cells before and after initial filtering:
+
+```{r nCells, include=T}
+# create tibble for plotting, ncol = cells, nrow = features
+df1 = tibble(
+  count = sapply(seur_unfilt,ncol),
+  filt = "Before",
+  LN_ID = ln_id
+)
+
+df2 = tibble(
+  count = sapply(seur_filt,ncol),
+  filt = "After",
+  LN_ID = ln_id
+)
+
+# plot
+# TO DO: add text above
+bind_rows(df1,df2) %>%
+  mutate(filt = factor(filt, levels = c("Before","After"))) %>%
+  ggplot(., aes(LN_ID, count, fill = filt)) + 
+  geom_bar(stat = "summary",
+           position="dodge") +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Filtering based on RNA library", 
+       y = "nCells", fill = "Filtered", x = NULL)
+
+ggsave("figures/01_01_rnaFilt_summary.png",width=5,height = 3)
+```
+
+Before downstream steps (ie: normalization, scaling, annotation, actual analysis, etc), need to QC cells based on ATAC seq by using ArchR.
+Afterwards, cells/barcodes that are still present after filtering each modality individual will be used for next steps.
+
+```{r save rds, include=F}
+qs::qsave(seur_filt, "rdata/01_seur_filt.qs", nthreads = 16)
+```
