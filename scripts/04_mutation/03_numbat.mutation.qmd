@@ -1,0 +1,543 @@
+---
+title: "Numbat haplotype-aware CNV analysis at single cell resolution"
+date: 14-02-2024
+---
+
+**Packages**
+
+```{r}
+#| label: setup
+library(Seurat)
+library(Signac)
+library(tidyverse, quietly = T)
+library(shiny)
+library(numbat)
+library(furrr)
+library(future.apply)
+
+source("_theme.R")
+
+# always set seed!!!
+set.seed(105)
+
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  sequential
+))
+```
+
+**Data import**
+
+```{r}
+#| label: data import
+#| eval: false
+
+
+LN_ID = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+wnn = qs::qread("rdata/02_04_integrated.qs", nthreads = 32)
+meta = wnn@meta.data
+
+# embeddings for plotting
+embeds = cbind(
+  Embeddings(wnn,"rpca.rnaPCA.wnnUMAP"),
+  Embeddings(wnn,"cca.sctPCA.wnnUMAP")
+)
+
+# rm wnn to free mem
+rm(wnn)
+gc()
+
+# import numbat results
+# import benchmark 1
+dir1 = paste0("rdata/numbat/benchmark1/",LN_ID)
+nbResults1 = lapply(dir1, Numbat$new)
+names(nbResults1) = LN_ID
+
+# import bench2 
+dir2 = paste0("rdata/numbat/benchmark2/",LN_ID)
+nbResults2 = lapply(dir2, Numbat$new)
+names(nbResults2) = LN_ID
+```
+
+## Running Numbat
+
+### Notes on preparing data
+
+-   Counted alleles and phased SNPs in bam files using `scripts/04_mutation/01_prepare.numbat.sh`
+-   Ran numbat in cluster with `scripts/04_mutation/02_run.numbat.slurmR`
+    -   Prepared the following input for `run_numbat()`:
+        1.  output of allele counts after SNP phasing
+        2.  count matrix (gene x cell)
+        3.  reference expression matrix
+
+### Important parameters
+
+-   Other notes for `run_numbat()` , see "Run Parameters": <https://kharchenkolab.github.io/numbat/articles/numbat.html>
+-   Lower `t` (transition property) is better for resolving additional subclonal events
+-   Lower `max_cost` generates more clones. Default: `ncol(count_mat) * tau`
+-   Default `tau` = 0.3, set lower to find more clones
+-   See `scripts/03_prelim.annotation/XX1_run.numbat.slurmR`
+
+### Benchmark 1
+
+-   Allele / Count input: all cells, separated by patient
+-   Expression reference: all cells except \_\_\_; collective shared reference
+-   `t` transition probability: 1e-6
+-   `tau` = 0.25
+
+### Benchmark 2
+
+-   Allele / Count input: all cells, separated by patient
+-   Expression reference: all cells except \_\_\_; used patient specific reference
+-   `t` transition probability: 1e-6
+-   `tau` = 0.25
+
+### Benchmark 3
+
+-   TO DO: use reference from rLN or lower transitional probabilities?
+
+## Initial Results
+
+### Compare pseudobulked clones and tumor prediction (output of `run_numbat`)
+
+```{r}
+#| label: get tumor prediction
+
+# get clone info
+# clone 1
+clonePost1 = lapply(
+  nbResults1,
+  function(nb) {
+    df = nb$clone_post
+    return(df)
+  }
+)
+
+clones1 = do.call(rbind,clonePost1)
+
+# clone 2
+clonePost2 = lapply(
+  nbResults2,
+  function(nb) {
+    df = nb$clone_post
+    return(df)
+  }
+)
+
+clones2 = do.call(rbind,clonePost2)
+
+# add to metadata and clone info to embeds for plotting
+# check: all(clones2$cell == rownames(meta))
+embeds = as_tibble(embeds, rownames = "cell_id") %>%
+  mutate(
+    sample = meta$Sample,
+    prelim_anno = meta$prelim_anno,
+    gt_b1 = clones1$GT_opt,
+    tumor_b1 = clones1$compartment_opt,
+    gt_b2 = clones2$GT_opt,
+    tumor_b2 = clones2$compartment_opt
+  )
+
+# get list of embeddings 
+umaps.tumor = lapply(LN_ID, function(x){
+  
+  # filter and plot
+  embed_sub = filter(embeds, sample == x)
+  
+  b1 = ggplot(embed_sub, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+    geom_jitter(aes(color = tumor_b1), size = 0.1, show.legend = F) +
+    theme_umap() +
+    scale_color_manual(values = c("#CBCBC5","#f07167")) +
+    labs(subtitle = "Benchmark 1", x = "wnnUMAP 1", y = "wnnUMAP 2")
+  
+  b2 = ggplot(embed_sub, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+    geom_jitter(aes(color = tumor_b2), size = 0.1) +
+    theme_umap() +
+    fix_legend() +
+    scale_color_manual(values = c("#CBCBC5","#f07167")) +
+    labs(subtitle = "Benchmark 2", x = "wnnUMAP 1", y = "wnnUMAP 2",
+         color = "Prediction")
+  
+  return(b1+b2)
+})
+
+# save and pull
+pl.dir = "figures/03/numbat/"
+
+for (i in seq_along(LN_ID)){
+  ggsave(
+    paste0(pl.dir,LN_ID[[i]],".benchmark.tumorcall.umap.png"),
+    umaps.tumor[[i]],
+    width = 6, height = 3
+  )
+}
+```
+
+```{r}
+#| label: path to pseudobulk clones
+#| eval: true
+#| include: false
+
+# need absolute paths!
+LN_ID = c("LN0025","LN0027","LN0177","LN0193","LN0438")
+
+plotpaths_bulk = purrr::map(
+  LN_ID, 
+  ~ file.path(
+    here::here(),
+    paste0("rdata/numbat/benchmark", c(1,2)),
+    .x,
+    "bulk_clones_final.png"
+  )
+)
+
+plotpaths_umap = file.path(
+    here::here(),
+    paste0("figures/03/numbat/",LN_ID,".benchmark.tumorcall.umap.png")
+)
+```
+
+#### LN0025
+
+```{r}
+#| layout-ncol: 1
+#| echo: false
+#| eval: true
+#| fig-cap:
+#|  - "Benchmark 1"
+#|  - "Benchmark 2"
+#|  - "Tumor call"
+
+knitr::include_graphics(plotpaths_bulk[[1]])
+knitr::include_graphics(plotpaths_umap[[1]])
+
+```
+
+#### LN0027
+
+```{r}
+#| layout-ncol: 1
+#| echo: false
+#| eval: true
+#| fig-subcap:
+#|  - "Benchmark 1"
+#|  - "Benchmark 2"
+#|  - "Tumor call"
+
+knitr::include_graphics(plotpaths_bulk[[2]])
+knitr::include_graphics(plotpaths_umap[[2]])
+
+```
+
+#### LN0177
+
+```{r}
+#| layout-ncol: 1
+#| echo: false
+#| eval: true
+#| fig-subcap:
+#|  - "Benchmark 1"
+#|  - "Benchmark 2"
+#|  - "Tumor call"
+
+knitr::include_graphics(plotpaths_bulk[[3]])
+knitr::include_graphics(plotpaths_umap[[3]])
+
+```
+
+#### LN0193
+
+```{r}
+#| layout-ncol: 1
+#| echo: false
+#| eval: true
+#| fig-subcap:
+#|  - "Benchmark 1"
+#|  - "Benchmark 2"
+#|  - "Tumor call"
+
+knitr::include_graphics(plotpaths_bulk[[4]])
+knitr::include_graphics(plotpaths_umap[[4]])
+
+```
+
+#### LN0438
+
+```{r}
+#| layout-ncol: 1
+#| echo: false
+#| eval: true
+#| fig-subcap:
+#|  - "Benchmark 1"
+#|  - "Benchmark 2"
+#|  - "Tumor call"
+
+knitr::include_graphics(plotpaths_bulk[[5]])
+knitr::include_graphics(plotpaths_umap[[5]])
+
+```
+
+Benchmark 1 had less background (lower tumor calls in T cells) and therefore was used as a starting point for downstream refinement.
+
+## Identify additional subclones
+
+-   Original numbat analysis identified a single tumor
+-   The number of subclones identified by `run_numbat()` can be refined by adjusting `k` parameter in `cut_tree()`
+
+TO DO: need to trouble shoot legend wrapping
+
+```{r}
+#| label: cut and plot
+
+# recut tree (k = 2) to see if subclones resolve ----
+## will this change the numbat benchmark directory?
+nb_k2 = lapply(nbResults1, function(x){
+    
+    # get 3 groups from 2 cuts
+    x$cutree(n_cut = 2)
+    return(x)
+})
+
+## get clone info
+clonePost_k2 = lapply(nb_k2, function(x){
+    df = x$clone_post
+    return(df)
+})
+
+clones_k2 = do.call(rbind,clonePost_k2)
+
+# check that all cells are in the same order
+embeds = embeds %>%
+  mutate(
+    gt_k2 = clones_k2$GT_opt,
+    clone_k2 = clones_k2$clone_opt,
+    tumor_k2 = clones_k2$compartment_opt
+  )
+
+# get list of embeddings 
+umaps.k2 = lapply(LN_ID, function(x){
+  
+  # filter and plot
+  embed_sub = filter(embeds, sample == x)
+  
+  b1 = ggplot(embed_sub, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+    geom_jitter(aes(color = gt_b1), size = 0.1) +
+    labs(subtitle = "k = 1", x = "wnnUMAP 1", y = "wnnUMAP 2",
+         color = "Genotype") +
+    theme_umap(
+      legend.text = element_text(size = 6)
+    ) +
+    fix_legend() +
+    scale_color_manual(
+      values = c("#CBCBC5","#00afb9"),
+      labels = ~ str_wrap(.x, width = 2)
+    )
+    
+  
+  b2 = ggplot(embed_sub, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+    geom_jitter(aes(color = gt_k2), size = 0.1) +
+    labs(subtitle = "k = 2", x = "wnnUMAP 1", y = "wnnUMAP 2",
+         color = "Genotype") +
+    theme_umap(
+      legend.text = element_text(size = 6)
+    ) +
+    fix_legend() +
+    scale_color_manual(
+      values = c("#CBCBC5","#f07167","#0081a7"),
+      labels = ~ str_wrap(.x, width = 2)
+    )
+    
+  return(b1+b2)
+})
+
+# save and pull
+pl.dir = "figures/03/numbat/"
+
+for (i in seq_along(LN_ID)){
+  ggsave(
+    paste0(pl.dir,LN_ID[[i]],".k2.clones.umap.png"),
+    umaps.k2[[i]],
+    width = 8, height = 3
+  )
+}
+
+```
+
+```{r}
+#| eval: true
+#| echo: false
+
+# get paths
+plotpaths_k2 = file.path(
+    here::here(),
+    paste0("figures/03/numbat/",LN_ID,".k2.clones.umap.png")
+)
+```
+
+#### LN0025
+
+```{r}
+#| echo: false
+#| eval: true
+
+knitr::include_graphics(plotpaths_k2[[1]])
+```
+
+#### LN0027
+
+```{r}
+#| echo: false
+#| eval: true
+
+knitr::include_graphics(plotpaths_k2[[2]])
+```
+
+#### LN0177
+
+```{r}
+#| echo: false
+#| eval: true
+
+knitr::include_graphics(plotpaths_k2[[3]])
+```
+
+#### LN0193
+
+```{r}
+#| echo: false
+#| eval: true
+
+knitr::include_graphics(plotpaths_k2[[4]])
+```
+
+#### LN0438
+
+```{r}
+#| echo: false
+#| eval: true
+
+knitr::include_graphics(plotpaths_k2[[5]])
+```
+
+Increasing `k` increased tumor calls in T cells, therefore will keep the original genotype and tumor calls from benchmark 1.
+
+## List of mutated genes
+
+TO DO
+
+### TO DO? Single cell posterior probabilities for each CNV?
+
+-   p_cnv: etc
+
+```{r}
+#| label: cnv_post_prob
+
+# get current joint_post
+jointPost = lapply(
+  nbResults2, 
+  function(nb) {
+    
+    # get probabilities for each cnv
+    df = as_tibble(nb$joint_post) %>%
+      mutate(cnv = factor(paste0(seg,"_",cnv_state))) %>%
+      # select(
+      #   cell,cnv,cnv_state,LLR,
+      #   CHROM,seg_start,seg_end,
+      #   n_genes,n_snp,
+      #   p_cnv,p_cnv_x,p_cnv_y
+      # )
+
+    return(df)
+  }
+)
+
+# add cell annotation
+jointPost = lapply(
+  seq_along(jointPost), 
+  function(x) {
+    # get cell anno
+    cellanno = tibble(
+      cell = rownames(meta),
+      major_type = meta$major_type,
+      prelim_anno = meta$prelim_anno,
+      tricycle = meta$tricycle
+    )
+    
+    df = left_join(jointPost[[x]], cellanno, by = "cell")
+    return(df)
+  }
+)
+
+
+# test plot, B cells only
+jointPost[[3]] %>%
+  filter(
+    #major_type %in% c("T"),
+    cnv_state != "loh",
+    LLR > 10
+  ) %>%
+  mutate(bcl2 = if_else(grepl("BCL2.hi", prelim_anno),"hi","lo")) %>%
+  ggplot(., aes(p_neu)) +
+  #geom_density() +
+  geom_density(aes(color = major_type)) +
+  facet_wrap(vars(cnv), scales = "free")
+```
+
+**Probability of calls**
+
+-   p_opt: Maximum a posteriori clone probability
+
+```{r}
+#| eval: false
+
+# TO DO MOVE
+# probability of clone call
+# clones_k2[sample(1:nrow(clones_k2), nrow(clones_k2), replace = F),] %>%
+#   ggplot(., aes(wnnUMAP_1, wnnUMAP_2))+
+#   geom_jitter(
+#     aes(color = p_opt), 
+#     size = 0.05, 
+#     alpha = 0.5
+#   )+
+#   scale_color_viridis_c(option = "magma", end = 0.85) +
+#   theme_umap() +
+#   facet_grid(cols = vars(orig.ident),
+#              rows = vars(clone_opt))
+```
+
+## To do: annotate cells
+
+```{r}
+#| label: annotation
+#| include: false
+
+# to do: more elegant way
+anno = rbind(clonePost[[1]],clonePost_k2[[2]],clonePost[[3]],clonePost_k2[[4]], fill = T)
+
+# check with all(rownames(meta) == anno$cell)
+meta$numbat.clone_opt = anno$clone_opt
+meta$numbat.GT_opt = anno$GT_opt
+meta$numbat.compartment_opt = anno$compartment_opt
+meta$numbat.p_opt = anno$p_opt
+
+# update wnn
+wnn@meta.data = meta
+qs::qsave(wnn, "rdata/03.XX2_wnn.qs", nthreads = 32)
+qs::qsave(anno, "rdata/03.XX2_cloneAnnoInfo.qs", nthreads = 32)
+
+```
+
+## Session Info
+
+```{r}
+#| label: sessioninfo
+#| eval: true
+#| echo: false
+
+sessionInfo()
+```
+
+## References
+
+-   original publication: <https://www.nature.com/articles/s41587-022-01468-y>
+-   <https://kharchenkolab.github.io/numbat/articles/numbat.html>

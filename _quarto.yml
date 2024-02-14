@@ -17,15 +17,6 @@ execute:
   include: true
   message: false
   warning: false
-
-# knitr:
-#   opts_chunk:
-#     comment: "#>"
-#     echo: true
-#     eval: false
-#     include: true
-#     message: false
-#     warning: false
     
 code-tools: true    
 code-overflow: scroll

@@ -14,3 +14,5 @@ analysis.Rproj
 old_scripts
 scripts/.DS_Store
 scripts/._.DS_Store
+
+/.quarto/

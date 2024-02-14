@@ -173,7 +173,6 @@ ggsave("figures/02/04_allwnnUMAPs.png",pl,width = 12, height = 8)
 TO DO
 
 ```{r}
-
 # set default assay to plot lognorm counts
 DefaultAssay(integrated) = "RNA"
 
@@ -188,7 +187,10 @@ genes = c("MS4A1","BCL2","MYC","CD3D","TRAC","CD8A")
    blend = T
  )
  
- ggsave("figures/02/04_wnnUMAP_pax5bcl2_lognormRNAcounts.png", featpl, height = 2.5, width = 9)
+ggsave(
+  "figures/02/04_wnnUMAP_pax5bcl2_lognormRNAcounts.png", 
+  featpl, height = 2.5, width = 9
+)
 ```
 
 ### Clustering
@@ -475,26 +477,6 @@ DotPlot(
   theme(axis.text.x = element_text(size = 10))
 ```
 
-### Relevel
-
-```{r}
-Tcells = c(
-  "T_sub1"="T_naive",
-  "T_sub2",
-  "T_sub3",
-  "T_sub4",
-  "T_sub5",
-  "T_sub6",
-  "T_sub7",
-  "17" = "T_sub8",
-  "15" = "T_sub9",
-  "14" = "T_sub10",
-  "18" = "T_sub11"
-)
-
-
-```
-
 ### To Troubleshoot/delete: Quick Annotation w label transfer of tonsil ref data
 
 -   problem with Seurat V5 data type
@@ -505,15 +487,15 @@ tonsilref = readRDS("/g/scb/zaugg/kou/R-lib/4.2.2-foss-2022b/tonsilref.SeuratDat
 #tonsilref = UpdateSeuratObject(tonsilref)
 
 # # keep GEX only
-# tFL_RNA = DietSeurat(
-#   integrated, 
-#   assays = c("RNA","SCT"),
-#   dimreducs = c("rpca.rnaPCA","rpca.sctPC","rpca.rnaPCA.wnnUMAP","rpca.sctPCA.wnnUMAP")
-# )
+tFL_RNA = DietSeurat(
+   wnn, 
+   assays = c("RNA","SCT"),
+   dimreducs = c("rpca.rnaPCA","rpca.sctPC","rpca.rnaPCA.wnnUMAP","rpca.sctPCA.wnnUMAP")
+)
 
 DefaultAssay(tFL_RNA) = "RNA"
 
-tFL_RNA = as(object = integrated[["RNA"]], Class = "Assay")
+tFL_RNA = as(object = wnn[["RNA"]], Class = "Assay")
 #tFL_RNA = JoinLayers(tFL_RNA)
 #tFL_RNA = FindVariableFeatures(tFL_RNA, layer = "data")
 
