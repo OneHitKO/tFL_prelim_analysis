@@ -78,27 +78,27 @@ names(nbResults2) = LN_ID
 -   Default `tau` = 0.3, set lower to find more clones
 -   See `scripts/03_prelim.annotation/XX1_run.numbat.slurmR`
 
-### Benchmark 1
+### Benchmarking parameters
+
+**Benchmark 1**
 
 -   Allele / Count input: all cells, separated by patient
 -   Expression reference: all cells except \_\_\_; collective shared reference
 -   `t` transition probability: 1e-6
 -   `tau` = 0.25
 
-### Benchmark 2
+**Benchmark 2**
 
 -   Allele / Count input: all cells, separated by patient
 -   Expression reference: all cells except \_\_\_; used patient specific reference
 -   `t` transition probability: 1e-6
 -   `tau` = 0.25
 
-### Benchmark 3
+**To do? Benchmark 3**
 
--   TO DO: use reference from rLN or lower transitional probabilities?
+-   use reference from rLN or lower transitional probabilities?
 
-## Initial Results
-
-### Compare pseudobulked clones and tumor prediction (output of `run_numbat`)
+## Initial Results: Pseudobulked clones and tumor prediction
 
 ```{r}
 #| label: get tumor prediction
@@ -279,7 +279,7 @@ knitr::include_graphics(plotpaths_umap[[5]])
 
 Benchmark 1 had less background (lower tumor calls in T cells) and therefore was used as a starting point for downstream refinement.
 
-## Identify additional subclones
+## Identifying potential additional subclones
 
 -   Original numbat analysis identified a single tumor
 -   The number of subclones identified by `run_numbat()` can be refined by adjusting `k` parameter in `cut_tree()`
@@ -419,111 +419,28 @@ knitr::include_graphics(plotpaths_k2[[4]])
 knitr::include_graphics(plotpaths_k2[[5]])
 ```
 
-Increasing `k` increased tumor calls in T cells, therefore will keep the original genotype and tumor calls from benchmark 1.
+Increasing `k` increased tumor calls in T cells, therefore will keep the original genotype and tumor calls from **benchmark 1**.
 
-## List of mutated genes
+## TO DO: List of genes in CNVs
 
-TO DO
+## TO DO? Single cell posterior probabilities for each CNV?
 
-### TO DO? Single cell posterior probabilities for each CNV?
+-   p_cnv
+-   p_opt
 
--   p_cnv: etc
-
-```{r}
-#| label: cnv_post_prob
-
-# get current joint_post
-jointPost = lapply(
-  nbResults2, 
-  function(nb) {
-    
-    # get probabilities for each cnv
-    df = as_tibble(nb$joint_post) %>%
-      mutate(cnv = factor(paste0(seg,"_",cnv_state))) %>%
-      # select(
-      #   cell,cnv,cnv_state,LLR,
-      #   CHROM,seg_start,seg_end,
-      #   n_genes,n_snp,
-      #   p_cnv,p_cnv_x,p_cnv_y
-      # )
-
-    return(df)
-  }
-)
-
-# add cell annotation
-jointPost = lapply(
-  seq_along(jointPost), 
-  function(x) {
-    # get cell anno
-    cellanno = tibble(
-      cell = rownames(meta),
-      major_type = meta$major_type,
-      prelim_anno = meta$prelim_anno,
-      tricycle = meta$tricycle
-    )
-    
-    df = left_join(jointPost[[x]], cellanno, by = "cell")
-    return(df)
-  }
-)
-
-
-# test plot, B cells only
-jointPost[[3]] %>%
-  filter(
-    #major_type %in% c("T"),
-    cnv_state != "loh",
-    LLR > 10
-  ) %>%
-  mutate(bcl2 = if_else(grepl("BCL2.hi", prelim_anno),"hi","lo")) %>%
-  ggplot(., aes(p_neu)) +
-  #geom_density() +
-  geom_density(aes(color = major_type)) +
-  facet_wrap(vars(cnv), scales = "free")
-```
-
-**Probability of calls**
-
--   p_opt: Maximum a posteriori clone probability
-
-```{r}
-#| eval: false
-
-# TO DO MOVE
-# probability of clone call
-# clones_k2[sample(1:nrow(clones_k2), nrow(clones_k2), replace = F),] %>%
-#   ggplot(., aes(wnnUMAP_1, wnnUMAP_2))+
-#   geom_jitter(
-#     aes(color = p_opt), 
-#     size = 0.05, 
-#     alpha = 0.5
-#   )+
-#   scale_color_viridis_c(option = "magma", end = 0.85) +
-#   theme_umap() +
-#   facet_grid(cols = vars(orig.ident),
-#              rows = vars(clone_opt))
-```
-
-## To do: annotate cells
+## Annotate cells
 
 ```{r}
 #| label: annotation
-#| include: false
 
-# to do: more elegant way
-anno = rbind(clonePost[[1]],clonePost_k2[[2]],clonePost[[3]],clonePost_k2[[4]], fill = T)
+# add benchmark 1 genotype and compartment
+wnn$numbat_gt = embeds$gt_b1
+wnn$numbat_tumor.pred = embeds$tumor_b1
 
-# check with all(rownames(meta) == anno$cell)
-meta$numbat.clone_opt = anno$clone_opt
-meta$numbat.GT_opt = anno$GT_opt
-meta$numbat.compartment_opt = anno$compartment_opt
-meta$numbat.p_opt = anno$p_opt
+# TO DO: get type of cnv mutation, update meta (in joint posterior results of nb)
 
-# update wnn
-wnn@meta.data = meta
-qs::qsave(wnn, "rdata/03.XX2_wnn.qs", nthreads = 32)
-qs::qsave(anno, "rdata/03.XX2_cloneAnnoInfo.qs", nthreads = 32)
+# save in original object
+qs::qsave(wnn, "rdata/02_04_integrated.qs", nthreads = 32)
 
 ```
 
