@@ -1,7 +1,5 @@
 project:
   title: "analysis"
-  render:
-    - scripts/04_mutation/03_numbat.mutation.qmd
 
 author: Kristy Ou
 
@@ -20,6 +18,7 @@ format:
     code-line-numbers: false
     theme: sandstone
     embed-resources: true
+    default-image-extension: svg
     
 code-tools: true    
 code-overflow: scroll
@@ -29,5 +28,3 @@ highlight-style: pygments
 number-sections: false
 toc: true
 toc-location: left
-
-

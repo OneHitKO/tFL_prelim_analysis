@@ -1,0 +1,220 @@
+---
+title: "Annotating T cells to Roider, et al."
+---
+
+**Libraries**
+
+```{r}
+#| label: load libraries
+#| eval: true
+
+library(Seurat)
+library(Signac)
+library(tidyverse)
+library(ggalluvial)
+
+source(paste0(here::here(),"/_theme.R"))
+```
+
+**Import data**
+
+```{r}
+#| label: import data
+
+wnn = qs::qread("rdata/02_04_integrated.qs", nthreads = 32)
+
+# susbet T
+wnn_T = subset(wnn, idents = levels(wnn)[grep("T_",levels(wnn))])
+
+# clear memory, add annotation back later
+rm(wnn)
+gc()
+
+# import tobias' data
+roider_T = readRDS("/g/scb/zaugg/kou/projects/lymphoma/CITEseq2020/Combined_T_wnn.rds")
+roider_markers = load("/g/scb/zaugg/kou/projects/lymphoma/CITEseq2020/markers.RData")
+
+roider_T = UpdateSeuratObject(roider_T)
+
+# update levels
+Idents(roider_T) = "IdentI"
+
+# rename levels based on paper
+rename = c(
+  "14" = "prolif",
+  "1" = "CD4_Naive",
+  "2" = "TH_CM1",
+  "9" = "TH_CM2",
+  "6" = "TFH",
+  "8" = "TREG_CM1",
+  "13" = "TREG_CM2",
+  "15" = "TREG_EM1",
+  "11" = "TREG_EM2",
+  "12" = "CD8_Naive",
+  "3" = "TTOX_EM1",
+  "16" = "TTOX_EM2",
+  "5" = "TTOX_EM3",
+  "19" = "T_DN"
+)
+
+levels(roider_T) = names(rename)
+roider_T = RenameIdents(roider_T, rename)
+roider_T$publ.anno = Idents(roider_T)
+```
+
+## Reprocess T cell subset
+
+-   Data was originally normalized with B cells, can redo normalization and scaling
+
+```{r}
+#| label: T subset prepro
+
+# first diet
+wnn_T = DietSeurat(
+  wnn_T,
+  layers = "counts",
+  assays = c("RNA","ATAC","GeneScoreImputed"),
+  dimreducs = "rpca.rnaPCA.wnnUMAP"
+)
+
+# renormalize
+wnn_T = NormalizeData(wnn_T)
+wnn_T = FindVariableFeatures(wnn_T)
+wnn_T = ScaleData(wnn_T)
+
+# also for reference
+DefaultAssay(roider_T) = "RNA"
+
+roider_T = NormalizeData(roider_T)
+roider_T = FindVariableFeatures(roider_T)
+roider_T = ScaleData(roider_T)
+
+# TO DO: dim reduc here if necessary
+```
+
+## Transfer Labels
+
+```{r}
+#| label: transfer anchors
+
+anchors = FindTransferAnchors(reference = roider_T, query = wnn_T)
+
+# returns df with scores and predicted id
+predictions = TransferData(
+  anchorset = anchors,
+  refdata = roider_T$publ.anno
+)
+
+# get embeddings 
+umapembed = Embeddings(wnn_T, "rpca.rnaPCA.wnnUMAP")
+
+# get meta
+meta_T = wnn_T@meta.data
+
+save(predictions, umapembed, meta_T, file = "rdata/for_render/roideranno.RData")
+```
+
+```{r}
+#| eval: true
+#| include: false
+
+# load data
+dir = here::here()
+load(paste0(dir,"/rdata/for_render/roideranno.RData"))
+
+```
+
+### Assignment Results
+
+```{r}
+#| eval: true
+#| fig-height: 12
+
+plot_df = cbind(
+  umapembed,
+  meta_T,
+  predictions
+)
+
+# prelim anno
+u1 = ggplot(plot_df, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+  geom_jitter(aes(color = prelim_anno), size = 0.1) +
+  theme_umap(legend.position = "bottom") +
+  labs(x = "wnnUMAP 1", y = "wnnUMAP 2", color = NULL, title = "WNN Clusters, res. 0.5") +
+  xlim(-2.5,10) +
+  ylim(-10,7.5) +
+  guides(
+    color = guide_legend(override.aes = list(size = 2)),
+    ncol = 2
+  )
+
+# predicted roider anno
+u2 = ggplot(plot_df, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+  geom_jitter(aes(color = predicted.id), size = 0.1) +
+  theme_umap(legend.position = "bottom") +
+  labs(x = "wnnUMAP 1", y = "wnnUMAP 2", color = NULL, title = "Transferred Labels") +
+  xlim(-2.5,10) +
+  ylim(-10,7.5) +
+  guides(
+    color = guide_legend(override.aes = list(size = 2)),
+    ncol = 2
+  )
+
+cowplot::plot_grid(u1,u2, nrow = 2)
+```
+
+```{r}
+#| eval: true
+#| fig-height: 8
+
+alluvial_df = plot_df %>%
+  group_by(prelim_anno, predicted.id) %>% 
+  summarise(frequency = n())
+
+# ggalluvial, rm freq < 20
+alluvial_df %>%
+  filter(frequency > 20) %>%
+  ggplot(., aes(y = frequency, axis1 = prelim_anno, axis2 = predicted.id)) + 
+  geom_alluvium(aes(fill = predicted.id)) +
+  geom_stratum() +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  theme_minimal() +
+  labs(x = NULL, y = "Frequency")
+  
+```
+
+### Score
+
+-   Lower score = lower probability of accurate label assignment
+
+```{r}
+#| eval: true
+
+ggplot(plot_df, aes(rpcarnaPCAwnnUMAP_1,rpcarnaPCAwnnUMAP_2)) +
+  geom_jitter(aes(color = prediction.score.max), size = 0.1) +
+  theme_umap() +
+  scale_color_viridis_c(option = "turbo") +
+  labs(x = "wnnUMAP 1", y = "wnnUMAP 2") +
+  xlim(-2.5,10) +
+  ylim(-10,7.5)
+```
+
+## Annotation
+
+```{r}
+
+```
+
+## Session Info
+
+```{r}
+#| eval: true
+#| echo: false
+
+sessionInfo()
+```
+
+## References
+
+-   <https://www.biorxiv.org/content/10.1101/2022.11.04.514366v3.full.pdf>
+-   <https://satijalab.org/seurat/reference/findtransferanchors>
