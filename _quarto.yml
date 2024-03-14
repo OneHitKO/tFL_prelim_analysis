@@ -2,6 +2,7 @@ project:
   title: "analysis"
 
 author: Kristy Ou
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
 
 editor: visual
 
